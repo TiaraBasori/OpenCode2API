@@ -70,7 +70,7 @@ const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
-const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
+const DEFAULT_EVENT_IDLE_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || 8000;
 
 const OPENCODE_BASENAME = 'opencode';
 
@@ -1006,6 +1006,11 @@ export function createApp(config) {
         let receivedDelta = false;
         let deltaChars = 0;
         let firstDeltaAt = null;
+        // Tracks internal OpenCode tool calls that are still pending/running. While any
+        // tool call is active, the stream must stay open even if no text deltas arrive
+        // (the backend is executing the tool). Resolving early here is what previously
+        // truncated streaming responses that relied on internal tool execution.
+        const activeToolCallIds = new Set();
         const startedAt = Date.now();
 
         const finishPromise = new Promise((resolve, reject) => {
@@ -1032,6 +1037,18 @@ export function createApp(config) {
                 if (idleTimer) clearTimeout(idleTimer);
                 idleTimer = setTimeout(() => {
                     if (finished) return;
+                    // A tool call is still executing on the backend. Keep the stream open
+                    // and wait instead of cutting the response short; the follow-up text
+                    // (or the final completion) will arrive once the tool finishes.
+                    if (activeToolCallIds.size > 0) {
+                        logDebug('Event idle while internal tool call is active, continuing to wait', {
+                            sessionId,
+                            ms: Date.now() - startedAt,
+                            activeTools: activeToolCallIds.size
+                        });
+                        scheduleIdleTimer();
+                        return;
+                    }
                     finished = true;
                     controller.abort();
                     logDebug('Event idle timeout', {
@@ -1048,11 +1065,27 @@ export function createApp(config) {
                 }, idleTimeoutMs);
             };
 
+            const trackToolActivity = (part) => {
+                if (!part || part.type !== 'tool') return;
+                const status = part.state?.status;
+                if (status === 'pending' || status === 'running') {
+                    if (part.id) activeToolCallIds.add(part.id);
+                } else if (status === 'completed' || status === 'error') {
+                    if (part.id) activeToolCallIds.delete(part.id);
+                }
+                // Tool activity means the session is still working; treat it as progress
+                // so the idle timer does not terminate the stream mid-execution.
+                receivedDelta = true;
+                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                scheduleIdleTimer();
+            };
+
             (async () => {
                 try {
                     for await (const event of eventStream) {
                         if (event.type === 'message.part.updated' && event.properties.part.sessionID === sessionId) {
                             const { part, delta } = event.properties;
+                            trackToolActivity(part);
                             if (delta) {
                                 receivedDelta = true;
                                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
@@ -1076,21 +1109,54 @@ export function createApp(config) {
                             }
                         }
                         if (event.type === 'message.updated' &&
-                            event.properties.info.sessionID === sessionId &&
-                            event.properties.info.finish === 'stop') {
-                            if (!finished) {
-                                finished = true;
-                                clearTimeout(timeoutId);
-                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                                if (idleTimer) clearTimeout(idleTimer);
-                                logDebug('SSE completed', {
-                                    sessionId,
-                                    ms: Date.now() - startedAt,
-                                    deltaChars
-                                });
-                                resolve({ content, reasoning });
+                            event.properties.info.sessionID === sessionId) {
+                            const info = event.properties.info;
+                            const finish = info.finish;
+                            // Reconcile active tool calls from the full message snapshot so we
+                            // detect pending tools even when only message.updated fires.
+                            if (Array.isArray(info.parts)) {
+                                for (const part of info.parts) {
+                                    if (part && part.type === 'tool') {
+                                        const status = part.state?.status;
+                                        if (status === 'pending' || status === 'running') {
+                                            if (part.id) activeToolCallIds.add(part.id);
+                                        } else if (status === 'completed' || status === 'error') {
+                                            if (part.id) activeToolCallIds.delete(part.id);
+                                        }
+                                    }
+                                }
                             }
-                            break;
+                            if (finish === 'tool') {
+                                // Assistant turn ended pending a tool call; keep waiting for the result.
+                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                                scheduleIdleTimer();
+                                continue;
+                            }
+                            if (finish === 'stop') {
+                                // Only treat the stream as completed when no tool call is still
+                                // pending. OpenCode may emit an intermediate 'stop' snapshot while a
+                                // tool call is in flight; resolving on it would drop the final answer.
+                                if (activeToolCallIds.size > 0) {
+                                    logDebug('Ignoring intermediate stop while tools are active', {
+                                        sessionId,
+                                        activeTools: activeToolCallIds.size
+                                    });
+                                    continue;
+                                }
+                                if (!finished) {
+                                    finished = true;
+                                    clearTimeout(timeoutId);
+                                    if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                                    if (idleTimer) clearTimeout(idleTimer);
+                                    logDebug('SSE completed', {
+                                        sessionId,
+                                        ms: Date.now() - startedAt,
+                                        deltaChars
+                                    });
+                                    resolve({ content, reasoning });
+                                }
+                                break;
+                            }
                         }
                     }
                 } catch (e) {
