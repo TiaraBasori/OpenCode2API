@@ -779,6 +779,81 @@ describe('Proxy OpenAI API', () => {
         expect(res.text).toContain('data: [DONE]');
     });
 
+    test('POST /v1/chat/completions streaming waits for internal tool execution instead of truncating', async () => {
+        // Regression test for issue #3: a streaming response that triggers an internal tool
+        // call (e.g. web_fetch) was truncated at the planning text. The collector resolved on
+        // an intermediate 'stop' snapshot (or idle-timed-out) while the tool was still running,
+        // so the final answer was dropped. The stream must stay open until the answer arrives.
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            const sessionId = 'test-session-id';
+            const mockEvents = [
+                {
+                    type: 'message.part.updated',
+                    properties: { part: { type: 'text', sessionID: sessionId }, delta: 'I need to search. ' }
+                },
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            sessionID: sessionId,
+                            finish: 'stop',
+                            parts: [
+                                { type: 'text', text: 'I need to search. ' },
+                                { type: 'tool', id: 'call_internal_1', tool: 'web_fetch', state: { status: 'pending', input: { url: 'https://example.com/weather' } } }
+                            ]
+                        }
+                    }
+                },
+                {
+                    type: 'message.part.updated',
+                    properties: { part: { type: 'text', sessionID: sessionId }, delta: 'The weather is 14C.' }
+                },
+                {
+                    type: 'message.updated',
+                    properties: {
+                        info: {
+                            sessionID: sessionId,
+                            finish: 'stop',
+                            parts: [
+                                { type: 'tool', id: 'call_internal_1', tool: 'web_fetch', state: { status: 'completed', input: { url: 'https://example.com/weather' }, output: '14C' } },
+                                { type: 'text', text: 'The weather is 14C.' }
+                            ]
+                        }
+                    }
+                }
+            ];
+            return {
+                stream: (async function* () {
+                    for (const event of mockEvents) {
+                        yield event;
+                    }
+                })()
+            };
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'What is the weather in Tokyo?' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('data: [DONE]');
+
+        const chunks = res.text.split('\n').filter(l => l.startsWith('data:') && !l.includes('[DONE]'));
+        let streamed = '';
+        for (const line of chunks) {
+            const json = JSON.parse(line.slice(5).trim());
+            const delta = json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content;
+            if (delta) streamed += delta;
+        }
+        // The full answer must be streamed, not just the planning text.
+        expect(streamed).toEqual('I need to search. The weather is 14C.');
+    });
+
     test('POST /v1/chat/completions includes reasoning tags in streaming', async () => {
         const res = await request(app)
             .post('/v1/chat/completions')
