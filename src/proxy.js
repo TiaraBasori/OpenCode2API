@@ -19,6 +19,130 @@ import {
     createExternalToolCallStreamParser
 } from './tool-runtime/parser.js';
 
+/**
+ * Transform upstream provider errors to OpenAI-compatible format
+ * @param {Error} error - The error from the upstream provider
+ * @returns {{statusCode: number, error: {message: string, type: string, code?: string}}} OpenAI-compatible error response
+ */
+function transformUpstreamError(error) {
+    // Default fallback
+    let statusCode = 500;
+    let message = error.message || 'Internal server error';
+    let type = 'internal_error';
+    let code = error.code || error.constructor.name;
+
+    // Handle timeout errors
+    if (error.message && error.message.includes('Request timeout')) {
+        statusCode = 504;
+        type = 'timeout';
+        code = 'timeout';
+        message = 'Request timeout';
+    }
+    // Handle file access errors (Windows compatibility)
+    else if (error.message && error.message.includes('ENOENT')) {
+        statusCode = 500;
+        type = 'internal_error';
+        code = 'file_access_error';
+        message = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
+    }
+    // Handle upstream provider errors (from OpenCode SDK)
+    else if (error.statusCode) {
+        statusCode = error.statusCode;
+        
+        // Map upstream error types to OpenAI-compatible types
+        const upstreamType = error.code || error.type || '';
+        const upstreamMessage = error.message || '';
+        
+        // Billing/credit errors - map to 402 Payment Required
+        if (upstreamType === 'CreditsError' || 
+            upstreamType === 'InsufficientBalanceError' ||
+            upstreamMessage.toLowerCase().includes('insufficient balance') ||
+            upstreamMessage.toLowerCase().includes('insufficient credits') ||
+            upstreamMessage.toLowerCase().includes('billing') ||
+            upstreamMessage.toLowerCase().includes('quota exceeded') ||
+            upstreamMessage.toLowerCase().includes('credit limit')) {
+            statusCode = 402;
+            type = 'insufficient_quota';
+            code = 'insufficient_quota';
+            message = upstreamMessage || 'Insufficient balance or quota exceeded';
+        }
+        // Rate limit errors - map to 429
+        else if (upstreamType === 'RateLimitError' ||
+                 upstreamType === 'TooManyRequestsError' ||
+                 statusCode === 429 ||
+                 upstreamMessage.toLowerCase().includes('rate limit') ||
+                 upstreamMessage.toLowerCase().includes('too many requests')) {
+            statusCode = 429;
+            type = 'rate_limit_exceeded';
+            code = 'rate_limit_exceeded';
+            message = upstreamMessage || 'Rate limit exceeded';
+        }
+        // Authentication errors - keep as 401
+        else if (upstreamType === 'AuthenticationError' ||
+                 upstreamType === 'InvalidAPIKeyError' ||
+                 statusCode === 401 ||
+                 upstreamMessage.toLowerCase().includes('invalid api key') ||
+                 upstreamMessage.toLowerCase().includes('unauthorized') ||
+                 upstreamMessage.toLowerCase().includes('authentication')) {
+            statusCode = 401;
+            type = 'invalid_api_key';
+            code = 'invalid_api_key';
+            message = upstreamMessage || 'Invalid API key';
+        }
+        // Permission errors - map to 403
+        else if (upstreamType === 'PermissionError' ||
+                 statusCode === 403 ||
+                 upstreamMessage.toLowerCase().includes('permission denied') ||
+                 upstreamMessage.toLowerCase().includes('access denied')) {
+            statusCode = 403;
+            type = 'permission_denied';
+            code = 'permission_denied';
+            message = upstreamMessage || 'Permission denied';
+        }
+        // Model not found - map to 404
+        else if (upstreamType === 'NotFoundError' ||
+                 statusCode === 404 ||
+                 upstreamMessage.toLowerCase().includes('model not found') ||
+                 upstreamMessage.toLowerCase().includes('does not exist')) {
+            statusCode = 404;
+            type = 'model_not_found';
+            code = 'model_not_found';
+            message = upstreamMessage || 'Model not found';
+        }
+        // Bad request - map to 400
+        else if (statusCode === 400 || upstreamType === 'BadRequestError') {
+            statusCode = 400;
+            type = 'invalid_request_error';
+            code = 'invalid_request_error';
+            message = upstreamMessage || 'Invalid request';
+        }
+        // Server errors from upstream - map to 502/503
+        else if (statusCode >= 500) {
+            statusCode = 502;
+            type = 'server_error';
+            code = 'server_error';
+            message = upstreamMessage || 'Upstream provider error';
+        }
+        // Default: pass through with mapped type
+        else {
+            type = upstreamType.toLowerCase().replace(/error$/, '_error') || 'upstream_error';
+            code = upstreamType;
+            message = upstreamMessage;
+        }
+    }
+
+    return {
+        statusCode,
+        error: {
+            message,
+            type,
+            ...(code && { code }),
+            ...(error.availableModels && { available_models: error.availableModels })
+        }
+    };
+}
+
+// --- Mutex Logic with Timeout ---
 async function getImageDataUri(url) {
     if (url.startsWith('data:')) {
         return url;
@@ -1763,24 +1887,8 @@ export function createApp(config) {
                     if (keepaliveInterval) clearInterval(keepaliveInterval);
 
                     if (!res.headersSent) {
-                        let errorMessage = error.message;
-                        let statusCode = 500;
-                        if (error.statusCode) {
-                            statusCode = error.statusCode;
-                        }
-                        if (error.message && error.message.includes('Request timeout')) {
-                            statusCode = 504;
-                        }
-                        if (error.message && error.message.includes('ENOENT')) {
-                            errorMessage = 'OpenCode backend file access error. This may be a Windows compatibility issue. Please try restarting the service.';
-                        }
-                        res.status(statusCode).json({
-                            error: {
-                                message: errorMessage,
-                                type: error.code || error.constructor.name,
-                                ...(error.availableModels && { available_models: error.availableModels })
-                            }
-                        });
+                        const transformed = transformUpstreamError(error);
+                        res.status(transformed.statusCode).json(transformed.error);
                     } else if (!res.destroyed) {
                         res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`);
                         res.end();
@@ -2536,14 +2644,8 @@ export function createApp(config) {
             return res.json(response);
         } catch (error) {
             console.error('[Proxy] Responses API Error:', error.message);
-            const statusCode = error.statusCode || 500;
-            res.status(statusCode).json({ 
-                error: { 
-                    message: error.message,
-                    type: error.code || error.constructor.name,
-                    ...(error.availableModels && { available_models: error.availableModels })
-                } 
-            });
+            const transformed = transformUpstreamError(error);
+            res.status(transformed.statusCode).json(transformed.error);
         }
     });
 
@@ -2889,3 +2991,5 @@ export function startProxy(options) {
         }
     };
 }
+
+// --- Mutex Logic with Timeout ---
