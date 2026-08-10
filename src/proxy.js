@@ -1740,11 +1740,32 @@ export function createApp(config) {
                             })}\n\n`);
                         }
 
+                        // Flush held buffers from the stream parsers and filters before final batch parse.
+                        const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
+                        const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
+                        const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
+                        const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
+                        const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
+                        const finalContentText = rawStreamedContent + flushedContentText;
+
+                        // Parse each channel, then retry on the two joined. Models sometimes open a
+                        // block in reasoning and close it in content, leaving neither channel with a
+                        // complete block. The joined retry only runs when nothing was found, so a
+                        // block contained in one channel is never counted twice.
+                        const parseStreamedToolCalls = () => {
+                            if (externalToolRegistry.length === 0) return [];
+                            const perChannel = [
+                                ...flushedReasoningCalls,
+                                ...flushedContentCalls,
+                                ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
+                            ];
+                            if (perChannel.length > 0) return perChannel;
+                            return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
+                        };
+
                         let parsedToolCalls = streamedToolCalls.length > 0
                             ? streamedToolCalls
-                            : (externalToolRegistry.length > 0
-                                ? parseExternalToolCallsFromText(externalToolRegistry, rawStreamedReasoning, rawStreamedContent)
-                                : []);
+                            : parseStreamedToolCalls();
                         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                             const forcedResponse = await requestForcedChatToolCall();
                             if (forcedResponse) {
@@ -2505,15 +2526,30 @@ export function createApp(config) {
                     } catch (e) { }
                 }
 
+                // Flush held buffers from the stream parsers and filters before final batch parse.
+                const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
+                const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
+                const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
+                const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
+                const finalReasoningText = (polledForToolCalls?.reasoning || rawReasoning) + flushedReasoningText;
+                const finalContentText = (polledForToolCalls?.content || rawContent) + flushedContentText;
+
+                // Parse each channel, then retry on the two joined. See the matching comment
+                // in /v1/chat/completions for why the joined retry is gated on finding nothing.
+                const parseStreamedToolCalls = () => {
+                    if (externalToolRegistry.length === 0) return [];
+                    const perChannel = [
+                        ...flushedReasoningCalls,
+                        ...flushedContentCalls,
+                        ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
+                    ];
+                    if (perChannel.length > 0) return perChannel;
+                    return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
+                };
+
                 let parsedToolCalls = streamedToolCalls.length > 0
                     ? streamedToolCalls
-                    : (externalToolRegistry.length > 0
-                        ? parseExternalToolCallsFromText(
-                            externalToolRegistry,
-                            polledForToolCalls?.reasoning || rawReasoning,
-                            polledForToolCalls?.content || rawContent
-                        )
-                        : []);
+                    : parseStreamedToolCalls();
                 if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                     const forcedResponse = await requestForcedResponsesToolCall();
                     if (forcedResponse) {
