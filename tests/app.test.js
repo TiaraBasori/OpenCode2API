@@ -854,6 +854,169 @@ describe('Proxy OpenAI API', () => {
         expect(streamed).toEqual('I need to search. The weather is 14C.');
     });
 
+    test('polling fallback waits for the assistant message to finish instead of returning a partial snapshot', async () => {
+        // Regression test: pollForAssistantResponse returned as soon as any part had text.
+        // A reasoning model emits its reasoning part before the text part, so the first
+        // snapshot is reasoning-only and unfinished. Returning it dropped the entire answer
+        // and produced a response consisting of nothing but a thinking block.
+        let call = 0;
+        sdkMocks.sessionMessages.mockImplementation(async () => {
+            call += 1;
+            if (call < 3) {
+                return [{
+                    info: { role: 'assistant' },
+                    parts: [{ type: 'reasoning', text: 'Let me read the file.' }]
+                }];
+            }
+            return [{
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'reasoning', text: 'Let me read the file.' },
+                    { type: 'text', text: 'The file says hello.' }
+                ]
+            }];
+        });
+        // Force the polling fallback: the event stream yields nothing usable.
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            throw new Error('event stream unavailable');
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Read a.txt' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        let streamed = '';
+        for (const line of res.text.split('\n')) {
+            if (!line.startsWith('data:') || line.includes('[DONE]')) continue;
+            const json = JSON.parse(line.slice(5).trim());
+            const delta = json.choices?.[0]?.delta?.content;
+            if (delta) streamed += delta;
+        }
+        expect(streamed).toContain('The file says hello.');
+        expect(call).toBeGreaterThanOrEqual(3);
+    });
+
+    test('polling fallback treats finish=tool as unfinished and keeps waiting', async () => {
+        // finish === 'tool' is an intermediate turn that pauses for a tool result. Treating
+        // it as terminal cut the response off before the post-tool answer arrived.
+        let call = 0;
+        sdkMocks.sessionMessages.mockImplementation(async () => {
+            call += 1;
+            if (call < 2) {
+                return [{
+                    info: { role: 'assistant', finish: 'tool' },
+                    parts: [{ type: 'text', text: 'Calling a tool. ' }]
+                }];
+            }
+            return [{
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Calling a tool. Done: 42.' }]
+            }];
+        });
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            throw new Error('event stream unavailable');
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Compute something' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        let streamed = '';
+        for (const line of res.text.split('\n')) {
+            if (!line.startsWith('data:') || line.includes('[DONE]')) continue;
+            const json = JSON.parse(line.slice(5).trim());
+            const delta = json.choices?.[0]?.delta?.content;
+            if (delta) streamed += delta;
+        }
+        expect(streamed).toContain('Done: 42.');
+    });
+
+    test('polling fallback returns the last partial snapshot when the timeout is reached', async () => {
+        // If the message never reports completion, the partial text still beats throwing a
+        // timeout error and losing everything the model produced.
+        sdkMocks.sessionMessages.mockImplementation(async () => ([{
+            info: { role: 'assistant' },
+            parts: [{ type: 'text', text: 'Partial answer that never completes' }]
+        }]));
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            throw new Error('event stream unavailable');
+        });
+
+        const shortTimeoutApp = createApp({
+            PORT: 10000,
+            API_KEY: 'test-key',
+            OPENCODE_SERVER_URL: 'http://127.0.0.1:10001',
+            REQUEST_TIMEOUT_MS: 1200,
+            DISABLE_TOOLS: false,
+            DEBUG: false
+        }).app;
+
+        const res = await request(shortTimeoutApp)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Hello' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('Partial answer that never completes');
+    });
+
+    test('streaming surfaces an upstream message error without waiting out the first-delta window', async () => {
+        // A message that the upstream aborts never emits another delta. The collector used to
+        // sit through the entire first-delta timeout before polling rediscovered the error.
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            const sessionId = 'test-session-id';
+            const mockEvents = [{
+                type: 'message.updated',
+                properties: {
+                    info: {
+                        sessionID: sessionId,
+                        error: { name: 'MessageAbortedError', data: { message: 'Aborted' } }
+                    }
+                }
+            }];
+            return {
+                stream: (async function* () {
+                    for (const event of mockEvents) yield event;
+                })()
+            };
+        });
+        sdkMocks.sessionMessages.mockImplementation(async () => ([{
+            info: { role: 'assistant', error: { name: 'MessageAbortedError', data: { message: 'Aborted' } } },
+            parts: []
+        }]));
+
+        const startedAt = Date.now();
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Hello' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('MessageAbortedError');
+        // Must not have burned the full first-delta window (30s by default).
+        expect(Date.now() - startedAt).toBeLessThan(5000);
+    });
+
     test('POST /v1/chat/completions includes reasoning tags in streaming', async () => {
         const res = await request(app)
             .post('/v1/chat/completions')
@@ -1029,6 +1192,36 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(200);
         expect(res.body.object).toEqual('response');
         expect(res.body.output[0].content[0].text).toBeDefined();
+    });
+
+    test('POST /v1/responses reports mid-stream failures on the open stream instead of crashing', async () => {
+        // Regression test: the /v1/responses catch block called res.json() unconditionally.
+        // After the SSE headers were sent that throws ERR_HTTP_HEADERS_SENT, which escaped the
+        // async handler as an unhandled rejection and killed the proxy process. Users saw the
+        // service "stop working" mid-session; the container restarted behind them.
+        sdkMocks.sessionMessages.mockImplementation(async () => {
+            throw new Error('upstream exploded after headers were sent');
+        });
+        sdkMocks.sessionPrompt.mockImplementation(async () => {
+            throw new Error('upstream exploded after headers were sent');
+        });
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            throw new Error('event stream unavailable');
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Hello',
+                stream: true
+            });
+
+        // Headers were already flushed as SSE, so the status stays 200 and the failure is
+        // reported as a stream event. The important part is that no exception escapes.
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('data: [DONE]');
     });
 
     test('POST /v1/responses accepts chat-style input array', async () => {
@@ -1647,5 +1840,112 @@ describe('Proxy OpenAI API', () => {
 
         expect(res.statusCode).toEqual(200);
         expect(res.body.output).toEqual([]);
+    });
+
+    /**
+     * The Responses API declares function tools flat: { type:'function', name, parameters }.
+     * buildExternalToolRegistry only read tool.function.name, so every tool from a Responses
+     * client was dropped. An empty registry means no tool contract is added to the prompt and
+     * no tool-call markup is parsed back out, so the model appears to ignore tools entirely.
+     */
+    test('external tool registry accepts flat Responses-API tool definitions', () => {
+        const flat = buildExternalToolRegistry([{
+            type: 'function',
+            name: 'read',
+            description: 'Read a file',
+            parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+        }]);
+
+        expect(flat).toHaveLength(1);
+        expect(flat[0].originalName).toBe('read');
+        expect(flat[0].namespacedName).toBe('external__read');
+        expect(flat[0].description).toBe('Read a file');
+        expect(flat[0].parameters.required).toEqual(['path']);
+        // Side-effect inference keyed off the name must still work on the flat shape.
+        expect(flat[0].sideEffect).toBe('read');
+    });
+
+    test('external tool registry keeps accepting nested Chat-Completions tool definitions', () => {
+        const nested = buildExternalToolRegistry([{
+            type: 'function',
+            function: {
+                name: 'read',
+                description: 'Read a file',
+                parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+            }
+        }]);
+
+        expect(nested).toHaveLength(1);
+        expect(nested[0].namespacedName).toBe('external__read');
+        expect(nested[0].description).toBe('Read a file');
+    });
+
+    test('POST /v1/responses advertises flat tools to the model and parses their calls back', async () => {
+        let sentSystem = '';
+        sdkMocks.sessionPrompt.mockImplementation(async (args) => {
+            sentSystem = args.body.system || '';
+            return {
+                data: {
+                    parts: [{
+                        type: 'text',
+                        text: '<function_calls>{"name":"external__read","arguments":{"path":"a.txt"}}</function_calls>'
+                    }]
+                }
+            };
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Read a.txt',
+                tools: [{
+                    type: 'function',
+                    name: 'read',
+                    description: 'Read a file',
+                    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+                }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        // The tool contract must reach the model.
+        expect(sentSystem).toContain('external__read');
+        const functionCalls = res.body.output.filter(item => item.type === 'function_call');
+        expect(functionCalls).toHaveLength(1);
+        expect(functionCalls[0].name).toBe('read');
+        expect(JSON.parse(functionCalls[0].arguments)).toEqual({ path: 'a.txt' });
+    });
+
+    test('POST /v1/responses honours a flat tool_choice forcing a specific tool', async () => {
+        let sentSystem = '';
+        sdkMocks.sessionPrompt.mockImplementation(async (args) => {
+            sentSystem = args.body.system || '';
+            return {
+                data: {
+                    parts: [{
+                        type: 'text',
+                        text: '<function_calls>{"name":"external__read","arguments":{"path":"a.txt"}}</function_calls>'
+                    }]
+                }
+            };
+        });
+
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                input: 'Read a.txt',
+                tools: [{
+                    type: 'function',
+                    name: 'read',
+                    parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }
+                }],
+                tool_choice: { type: 'function', name: 'read' }
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(sentSystem).toContain('You MUST call external__read');
     });
 });

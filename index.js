@@ -147,6 +147,17 @@ console.log(`  - Cleanup Interval: ${finalConfig.CLEANUP_INTERVAL_MS}ms`);
 console.log(`  - Cleanup Max Age: ${finalConfig.CLEANUP_MAX_AGE_MS}ms`);
 console.log(`  - Debug: ${finalConfig.DEBUG ? 'Yes' : 'No'}`);
 
+// A rejected promise inside a request handler must not take the whole proxy down.
+// Node's default --unhandled-rejections=throw turns one bad request into a process
+// exit, which reads to users as "the service stopped working after a while".
+process.on('unhandledRejection', (reason) => {
+    const detail = reason instanceof Error
+        ? `${reason.name}: ${reason.message}`
+        : typeof reason === 'string' ? reason : JSON.stringify(reason);
+    console.error('[Proxy] Unhandled rejection (request dropped, server continues):', detail);
+    if (reason instanceof Error && reason.stack) console.error(reason.stack);
+});
+
 // Start the proxy
 try {
     const proxy = startProxy(finalConfig);

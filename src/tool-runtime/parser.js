@@ -70,6 +70,18 @@ function registryNames(registry) {
     return [...names].sort((a, b) => b.length - a.length);
 }
 
+/** Map every accepted tool name (namespaced and original) to its declared JSON schema. */
+function registrySchemas(registry) {
+    const schemas = new Map();
+    if (!Array.isArray(registry)) return schemas;
+    registry.forEach((tool) => {
+        if (!tool?.parameters) return;
+        if (tool.namespacedName) schemas.set(tool.namespacedName, tool.parameters);
+        if (tool.originalName) schemas.set(tool.originalName, tool.parameters);
+    });
+    return schemas;
+}
+
 /**
  * DSML parameter bodies usually sit on their own line. Drop one leading and one trailing
  * newline so `<parameter>\nvalue\n</parameter>` yields "value", while interior whitespace
@@ -133,7 +145,16 @@ function rawCallsFromJsonText(text) {
     try {
         return rawCallsFromJsonPayload(JSON.parse(trimmed));
     } catch {
-        return [];
+        // The body may be prefixed by stray markup — a nested <function_calls> tag copied
+        // from the contract reminder, or a tool wrapper tag emitted by the model before
+        // the JSON payload. Scan for the first balanced JSON value and try again.
+        const found = findFirstJsonValue(trimmed);
+        if (!found) return [];
+        try {
+            return rawCallsFromJsonPayload(JSON.parse(found.json));
+        } catch {
+            return [];
+        }
     }
 }
 
@@ -271,6 +292,66 @@ function argsFromAttrs(attrs) {
 }
 
 /**
+ * Coerce an XML child element's text using the declared JSON-schema type. A schema type of
+ * `string` is honoured verbatim so a path like `123.txt` or a body of JSON-looking text is
+ * not silently turned into a number or an object.
+ */
+function coerceSchemaValue(value, schema) {
+    const type = Array.isArray(schema?.type) ? schema.type[0] : schema?.type;
+    if (type === 'string') return value;
+    const trimmed = value.trim();
+    if (!trimmed) return value;
+    if (type === 'number' || type === 'integer') {
+        const num = Number(trimmed);
+        return Number.isFinite(num) ? num : value;
+    }
+    if (type === 'boolean') {
+        if (/^true$/i.test(trimmed)) return true;
+        if (/^false$/i.test(trimmed)) return false;
+        return value;
+    }
+    if (type === 'object' || type === 'array') {
+        try {
+            return JSON.parse(trimmed);
+        } catch {
+            return value;
+        }
+    }
+    // Untyped: fall back to the permissive decoding used elsewhere.
+    return coerceParamValue(value, '');
+}
+
+/**
+ * Arguments carried as XML child elements rather than JSON:
+ *
+ *   <read>
+ *     <path>a.txt</path>
+ *     <offset>10</offset>
+ *   </read>
+ *
+ * Widely used by Cline/Roo-style harnesses, so many models emit it from training even when
+ * asked for JSON. Only child names declared in the tool's own schema are accepted, which
+ * keeps prose containing angle brackets from being mistaken for arguments.
+ */
+function argsFromXmlChildren(body, parameters) {
+    const properties = parameters && typeof parameters === 'object' ? parameters.properties : null;
+    if (!properties || typeof properties !== 'object') return null;
+    const allowed = Object.keys(properties);
+    if (!allowed.length) return null;
+
+    const args = {};
+    let matched = 0;
+    for (const key of allowed) {
+        const re = new RegExp(`<${escapeRegExp(key)}\\s*>([\\s\\S]*?)</${escapeRegExp(key)}\\s*>`, 'i');
+        const found = body.match(re);
+        if (!found) continue;
+        matched += 1;
+        args[key] = coerceSchemaValue(trimParamValue(found[1]), properties[key]);
+    }
+    return matched > 0 ? args : null;
+}
+
+/**
  * End index of a tag's attribute region, skipping over quoted strings and balanced JSON
  * so that a `>` inside an attribute value (`arguments={"command":"ls > out"}`) does not
  * terminate the tag early.
@@ -306,7 +387,7 @@ function findTagEnd(text, from) {
  * Registry-gated tag formats: `<tool .../>`, `<tool ...>body</tool>`, and an unclosed
  * `<tool ...>` followed by a JSON body.
  */
-function extractTagNamed(text, names) {
+function extractTagNamed(text, names, schemas = new Map()) {
     const calls = [];
     const spans = [];
     if (!names.length) return { calls, spans };
@@ -366,7 +447,11 @@ function extractTagNamed(text, names) {
                 }
             }
         } else {
-            calls.push({ name, arguments: {} });
+            // No JSON body. Arguments may still be present as XML child elements named
+            // after the schema's properties; dropping them here produced tool calls with
+            // empty arguments, which fail validation for any tool with required fields.
+            const xmlArgs = argsFromXmlChildren(body, schemas.get(name));
+            calls.push({ name, arguments: xmlArgs || {} });
         }
         spans.push([match.index, consumedEnd]);
     }
@@ -399,12 +484,13 @@ function collectAll(text, registry) {
     const source = typeof text === 'string' ? text : '';
     if (!source) return { calls: [], spans: [] };
     const names = registryNames(registry);
+    const schemas = registrySchemas(registry);
 
     const results = [
         extractCanonical(source),
         extractDsml(source),
         extractJsonWrapper(source),
-        extractTagNamed(source, names),
+        extractTagNamed(source, names, schemas),
         extractBareJson(source, names)
     ];
 

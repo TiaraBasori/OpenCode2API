@@ -259,6 +259,87 @@ describe('tag-named formats', () => {
     });
 });
 
+/**
+ * Cline/Roo-style markup, where each argument is its own XML child element. Captured live
+ * from deepseek-v4-flash-free: `<read>\n<path>a.txt</path>\n</read>`. The tag was matched
+ * but the children were discarded, producing a call with empty arguments that then failed
+ * schema validation for any tool with required fields.
+ */
+describe('XML child element arguments', () => {
+    const xmlRegistry = buildExternalToolRegistry([
+        {
+            type: 'function',
+            name: 'read',
+            description: 'Read a file',
+            parameters: {
+                type: 'object',
+                properties: {
+                    path: { type: 'string' },
+                    offset: { type: 'number' },
+                    recursive: { type: 'boolean' }
+                },
+                required: ['path']
+            }
+        },
+        {
+            type: 'function',
+            name: 'bash',
+            description: 'Run a command',
+            parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] }
+        }
+    ]);
+
+    test('parses a single child element on its own line', () => {
+        const text = '<read>\n<path>a.txt</path>\n</read>';
+        const { name, args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
+        expect(name).toBe('read');
+        expect(args).toEqual({ path: 'a.txt' });
+    });
+
+    test('parses multiple children and coerces by declared schema type', () => {
+        const text = '<read><path>a.txt</path><offset>10</offset><recursive>true</recursive></read>';
+        const { args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
+        expect(args).toEqual({ path: 'a.txt', offset: 10, recursive: true });
+    });
+
+    test('keeps a numeric-looking string argument as a string', () => {
+        const text = '<read><path>123.txt</path></read>';
+        const { args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
+        expect(args).toEqual({ path: '123.txt' });
+        expect(typeof args.path).toBe('string');
+    });
+
+    test('accepts the namespaced tag name', () => {
+        const text = '<external__read><path>/tmp/x.log</path></external__read>';
+        const { name, args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
+        expect(name).toBe('read');
+        expect(args).toEqual({ path: '/tmp/x.log' });
+    });
+
+    test('preserves a redirect inside a child element value', () => {
+        const text = '<bash><command>ls > out.txt</command></bash>';
+        const { args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
+        expect(args).toEqual({ command: 'ls > out.txt' });
+    });
+
+    test('ignores child elements that are not declared in the schema', () => {
+        const text = '<read><path>a.txt</path><rm_rf>/</rm_rf></read>';
+        const { args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
+        expect(args).toEqual({ path: 'a.txt' });
+    });
+
+    test('strips the markup from visible text', () => {
+        const text = 'Let me look: <read>\n<path>a.txt</path>\n</read>';
+        expect(stripFunctionCallMarkup(text, true, { registry: xmlRegistry })).toBe('Let me look:');
+    });
+
+    test('still yields empty arguments when the body has no recognizable children', () => {
+        const text = '<read>just some prose</read>';
+        const { args } = firstCall(parseExternalToolCallsFromText(xmlRegistry, text));
+        expect(args).toEqual({});
+    });
+});
+
 describe('bare JSON format', () => {
     test('parses whole-body JSON object', () => {
         const text = '{"name":"external__bash","arguments":{"command":"ls"}}';
@@ -470,5 +551,28 @@ describe('cross-channel blocks', () => {
     test('bare JSON in one channel still parses when that channel is passed alone', () => {
         const calls = parseExternalToolCallsFromText(registry, '{"name":"bash","arguments":{"command":"ls"}}');
         expect(calls).toHaveLength(1);
+    });
+});
+
+describe('rawCallsFromJsonText JSON scan fallback', () => {
+    test('parses nested function_calls wrapper emitted by models echoing the reminder', () => {
+        const nested = '<function_calls>\n<function_calls>\n{"name":"external__bash","arguments":{"command":"ls"}}\n</function_calls>';
+        const { name, args } = firstCall(parseExternalToolCallsFromText(registry, nested));
+        expect(name).toBe('bash');
+        expect(args).toEqual({ command: 'ls' });
+    });
+
+    test('scan fallback works for JSON prefixed by prose inside the block', () => {
+        const text = '<function_calls>calling tool: {"name":"external__bash","arguments":{"command":"pwd"}}</function_calls>';
+        const { name, args } = firstCall(parseExternalToolCallsFromText(registry, text));
+        expect(name).toBe('bash');
+        expect(args).toEqual({ command: 'pwd' });
+    });
+
+    test('clean canonical format still parses correctly after the fallback was added', () => {
+        const text = '<function_calls>{"name":"external__bash","arguments":{"command":"echo hi"}}</function_calls>';
+        const { name, args } = firstCall(parseExternalToolCallsFromText(registry, text));
+        expect(name).toBe('bash');
+        expect(args).toEqual({ command: 'echo hi' });
     });
 });

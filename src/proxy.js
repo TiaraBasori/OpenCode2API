@@ -193,7 +193,10 @@ const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
-const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
+// Reasoning models can take well over 10s before emitting their first token.
+// A short window here makes the event stream give up and fall back to polling on
+// every request, which loses true streaming. Configurable for slow backends.
+const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || 30000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || 8000;
 
 const OPENCODE_BASENAME = 'opencode';
@@ -1078,15 +1081,22 @@ export function createApp(config) {
     }
 
     function extractFromParts(parts) {
-        if (!Array.isArray(parts)) return { content: '', reasoning: '' };
+        if (!Array.isArray(parts)) return { content: '', reasoning: '', toolParts: [] };
         const content = parts.filter(p => p.type === 'text').map(p => p.text).join('');
         const reasoning = parts.filter(p => p.type === 'reasoning').map(p => p.text).join('');
-        return { content, reasoning };
+        const toolParts = parts.filter(p => p.type === 'tool');
+        return { content, reasoning, toolParts };
     }
 
     async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS) {
         const pollStart = Date.now();
         const startedAt = Date.now();
+        // Best-effort snapshot of the most recent in-flight assistant message. Polling
+        // observes partial messages: a reasoning model emits its reasoning part first and
+        // the text part only afterwards, so returning on the first non-empty snapshot
+        // truncates the answer to the reasoning alone. Keep the partial around purely as
+        // a timeout fallback and otherwise wait for the message to actually finish.
+        let lastPartial = null;
         while (Date.now() - startedAt < timeoutMs) {
             const messagesRes = await client.session.messages({ path: { id: sessionId } });
             const messages = messagesRes?.data || messagesRes || [];
@@ -1095,10 +1105,25 @@ export function createApp(config) {
                     const entry = messages[i];
                     const info = entry?.info;
                     if (info?.role !== 'assistant') continue;
-                    const { content, reasoning } = extractFromParts(entry?.parts || []);
+                    const { content, reasoning, toolParts } = extractFromParts(entry?.parts || []);
                     const error = info?.error || null;
-                    const done = Boolean(info.finish || info.time?.completed || error);
-                    if (done || content || reasoning) {
+                    // finish === 'tool' marks an intermediate turn that pauses for a tool
+                    // result; the assistant is not done producing output yet.
+                    const finished = info.finish && info.finish !== 'tool';
+                    const done = Boolean(finished || info.time?.completed || error);
+                    if (toolParts.length > 0) {
+                        logDebug('Polling found tool parts', {
+                            sessionId,
+                            count: toolParts.length,
+                            parts: toolParts.map(p => ({
+                                id: p.id,
+                                tool: p.tool,
+                                status: p.state?.status,
+                                input: p.state?.input
+                            }))
+                        });
+                    }
+                    if (done) {
                         if (error) {
                             console.error('[Proxy] OpenCode assistant error:', error);
                         }
@@ -1112,9 +1137,22 @@ export function createApp(config) {
                         });
                         return { content, reasoning, error };
                     }
+                    if (content || reasoning) {
+                        lastPartial = { content, reasoning, error: null };
+                    }
+                    break;
                 }
             }
             await sleep(intervalMs);
+        }
+        if (lastPartial) {
+            logDebug('Polling timeout with partial response', {
+                sessionId,
+                ms: Date.now() - pollStart,
+                contentLen: lastPartial.content.length,
+                reasoningLen: lastPartial.reasoning.length
+            });
+            return lastPartial;
         }
         logDebug('Polling timeout', { sessionId, ms: Date.now() - pollStart });
         throw new Error(`Request timeout after ${timeoutMs}ms`);
@@ -1236,6 +1274,22 @@ export function createApp(config) {
                             event.properties.info.sessionID === sessionId) {
                             const info = event.properties.info;
                             const finish = info.finish;
+                            // An aborted or failed message never produces another delta. Without
+                            // this, the collector waits out the whole first-delta window before
+                            // polling rediscovers the same error.
+                            if (info.error && !finished) {
+                                finished = true;
+                                clearTimeout(timeoutId);
+                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                                if (idleTimer) clearTimeout(idleTimer);
+                                logDebug('SSE upstream message error', {
+                                    sessionId,
+                                    ms: Date.now() - startedAt,
+                                    error: info.error.name || 'UnknownError'
+                                });
+                                resolve({ content, reasoning, error: info.error });
+                                break;
+                            }
                             // Reconcile active tool calls from the full message snapshot so we
                             // detect pending tools even when only message.updated fires.
                             if (Array.isArray(info.parts)) {
@@ -1523,7 +1577,13 @@ export function createApp(config) {
                         body: {
                             model: { providerID: pID, modelID: mID },
                             system: systemWithGuard,
-                            parts: parts,
+                            // Append a short contract reminder as the last part so the model
+                            // sees it immediately before generating. With the contract only in
+                            // the 16KB+ system prompt it gets buried; position matters a lot for
+                            // compliance. deepseek-v4-flash-free: 50% → 100% call rate.
+                            parts: externalToolContext.reminder
+                                ? [...parts, { type: 'text', text: externalToolContext.reminder }]
+                                : parts,
                             ...(requestParams.max_tokens && { max_tokens: requestParams.max_tokens }),
                             ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
                             ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
@@ -2239,7 +2299,9 @@ export function createApp(config) {
                 body: {
                     model: { providerID: pID, modelID: mID },
                     ...(systemWithGuard ? { system: systemWithGuard } : {}),
-                    parts,
+                    parts: externalToolContext.reminder
+                        ? [...parts, { type: 'text', text: externalToolContext.reminder }]
+                        : parts,
                     ...(max_output_tokens && { max_tokens: max_output_tokens }),
                     ...(temperature !== undefined && { temperature }),
                     ...(top_p !== undefined && { top_p })
@@ -2679,9 +2741,25 @@ export function createApp(config) {
 
             return res.json(response);
         } catch (error) {
-            console.error('[Proxy] Responses API Error:', error.message);
+            console.error('[Proxy] Responses API Error:', error?.message || error?.data?.message || error?.name || error);
             const transformed = transformUpstreamError(error);
-            res.status(transformed.statusCode).json(transformed.error);
+            // Once the SSE headers are out, res.json() throws ERR_HTTP_HEADERS_SENT. That throw
+            // escapes this async handler as an unhandled rejection, which terminates the whole
+            // process under Node's default --unhandled-rejections=throw. Report the failure on
+            // the already-open stream instead.
+            if (res.headersSent) {
+                try {
+                    res.write(`data: ${JSON.stringify({
+                        type: 'response.failed',
+                        response: { error: transformed.error.error || transformed.error }
+                    })}\n\n`);
+                    res.write('data: [DONE]\n\n');
+                } catch (writeError) {
+                    logDebug('Failed to report error on open response stream', { error: writeError.message });
+                }
+                return res.end();
+            }
+            return res.status(transformed.statusCode).json(transformed.error);
         }
     });
 
