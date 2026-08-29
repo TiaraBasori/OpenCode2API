@@ -17,19 +17,47 @@ function normalizeParameters(parameters) {
   return { type: 'object', properties: {} };
 }
 
-function inferSideEffect(tool = {}) {
-  const declared = tool?.x_proxy_side_effect || tool?.function?.x_proxy_side_effect;
+/**
+ * Normalizes the two function-tool shapes the proxy receives.
+ *
+ * Chat Completions nests the definition:  { type:'function', function:{ name, parameters } }
+ * The Responses API keeps it flat:        { type:'function', name, parameters }
+ *
+ * Callers used to read `tool.function.name` directly, so every Responses-API tool was
+ * silently dropped from the registry. An empty registry means no tool contract reaches the
+ * prompt and no tool-call markup is ever parsed back out, which is indistinguishable from
+ * a model that simply refuses to call tools.
+ */
+export function normalizeToolDefinition(tool) {
+  if (!tool || tool.type !== 'function') return null;
+  const definition = tool.function && typeof tool.function === 'object' ? tool.function : tool;
+  const name = String(definition.name || '').trim();
+  if (!name) return null;
+  return {
+    name,
+    description: definition.description,
+    parameters: definition.parameters,
+    enabled: definition.enabled,
+    x_proxy_side_effect: definition.x_proxy_side_effect ?? tool.x_proxy_side_effect,
+    x_proxy_risk_level: definition.x_proxy_risk_level ?? tool.x_proxy_risk_level,
+    x_proxy_requires_confirmation:
+      definition.x_proxy_requires_confirmation ?? tool.x_proxy_requires_confirmation
+  };
+}
+
+function inferSideEffect(definition = {}) {
+  const declared = definition.x_proxy_side_effect;
   if (declared) return normalizeSideEffect(declared, TOOL_SIDE_EFFECTS.NONE);
 
-  const name = String(tool?.function?.name || '').toLowerCase();
+  const name = String(definition.name || '').toLowerCase();
   if (/^(get|list|search|find|read|fetch|lookup)/.test(name)) return TOOL_SIDE_EFFECTS.READ;
   if (/^(create|update|set|post|write|send)/.test(name)) return TOOL_SIDE_EFFECTS.WRITE;
   if (/^(delete|remove|destroy)/.test(name)) return TOOL_SIDE_EFFECTS.DELETE;
   return TOOL_SIDE_EFFECTS.NONE;
 }
 
-function inferRiskLevel(tool = {}, sideEffect = TOOL_SIDE_EFFECTS.NONE) {
-  const declared = tool?.x_proxy_risk_level || tool?.function?.x_proxy_risk_level;
+function inferRiskLevel(definition = {}, sideEffect = TOOL_SIDE_EFFECTS.NONE) {
+  const declared = definition.x_proxy_risk_level;
   if (declared) return normalizeRiskLevel(declared, TOOL_RISK_LEVELS.LOW);
   if (sideEffect === TOOL_SIDE_EFFECTS.DELETE || sideEffect === TOOL_SIDE_EFFECTS.PAYMENT) {
     return TOOL_RISK_LEVELS.CRITICAL;
@@ -40,12 +68,9 @@ function inferRiskLevel(tool = {}, sideEffect = TOOL_SIDE_EFFECTS.NONE) {
   return TOOL_RISK_LEVELS.LOW;
 }
 
-function inferRequiresConfirmation(tool = {}, sideEffect = TOOL_SIDE_EFFECTS.NONE, riskLevel = TOOL_RISK_LEVELS.LOW) {
-  if (typeof tool?.x_proxy_requires_confirmation === 'boolean') {
-    return tool.x_proxy_requires_confirmation;
-  }
-  if (typeof tool?.function?.x_proxy_requires_confirmation === 'boolean') {
-    return tool.function.x_proxy_requires_confirmation;
+function inferRequiresConfirmation(definition = {}, sideEffect = TOOL_SIDE_EFFECTS.NONE, riskLevel = TOOL_RISK_LEVELS.LOW) {
+  if (typeof definition.x_proxy_requires_confirmation === 'boolean') {
+    return definition.x_proxy_requires_confirmation;
   }
   return sideEffect === TOOL_SIDE_EFFECTS.WRITE || riskLevel === TOOL_RISK_LEVELS.HIGH || riskLevel === TOOL_RISK_LEVELS.CRITICAL;
 }
@@ -57,9 +82,9 @@ export function buildExternalToolRegistry(tools, options = {}) {
   const seenNamespaced = new Set();
 
   tools.forEach((tool, index) => {
-    if (tool?.type !== 'function' || !tool?.function?.name) return;
-    const originalName = String(tool.function.name).trim();
-    if (!originalName) return;
+    const definition = normalizeToolDefinition(tool);
+    if (!definition) return;
+    const originalName = definition.name;
 
     let namespacedName = `${prefix}${originalName}`;
     let counter = 2;
@@ -69,18 +94,18 @@ export function buildExternalToolRegistry(tools, options = {}) {
     }
     seenNamespaced.add(namespacedName);
 
-    const sideEffect = inferSideEffect(tool);
-    const riskLevel = inferRiskLevel(tool, sideEffect);
+    const sideEffect = inferSideEffect(definition);
+    const riskLevel = inferRiskLevel(definition, sideEffect);
     registry.push({
       id: `external_tool_${index + 1}`,
       originalName,
       namespacedName,
-      description: normalizeDescription(tool.function.description),
-      parameters: normalizeParameters(tool.function.parameters),
+      description: normalizeDescription(definition.description),
+      parameters: normalizeParameters(definition.parameters),
       sideEffect,
       riskLevel,
-      requiresConfirmation: inferRequiresConfirmation(tool, sideEffect, riskLevel),
-      enabled: tool?.function?.enabled !== false,
+      requiresConfirmation: inferRequiresConfirmation(definition, sideEffect, riskLevel),
+      enabled: definition.enabled !== false,
       sourceTool: tool
     });
   });
