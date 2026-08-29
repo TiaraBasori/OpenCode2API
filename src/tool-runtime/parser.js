@@ -479,6 +479,47 @@ function extractBareJson(text, names) {
     return { calls, spans: [[0, text.length]] };
 }
 
+/**
+ * `<function=name>` / `<parameter=key>value</parameter>` markup, the native tool-call
+ * dialect of Qwen/GLM-family models and some OpenCode free-tier models:
+ *
+ *   <tool_call>
+ *   <function=webfetch>
+ *   <parameter=url>https://example.com</parameter>
+ *   <parameter=format>html</parameter>
+ *   </function>
+ *   </tool_call>
+ *
+ * The surrounding `<tool_call>` container is already consumed by extractJsonWrapper
+ * (which strips it as a span even when the body is not JSON), so here we only recognise
+ * the `<function=...>` opener, collect its `<parameter=...>` children, and mark the
+ * whole `<function>...</function>` block for hiding. Name mapping (e.g. `webfetch` →
+ * `web_fetch`) is resolved later against the request's registry.
+ */
+function extractFunctionEquals(text) {
+    const calls = [];
+    const spans = [];
+    const openerRe = /<function\s*=\s*([^\s/>]+)\s*>/gi;
+    for (const match of text.matchAll(openerRe)) {
+        const name = match[1].trim();
+        if (!name) continue;
+        const openEnd = match.index + match[0].length;
+        const closeIdx = text.indexOf('</function>', openEnd);
+        const end = closeIdx === -1 ? text.length : closeIdx + '</function>'.length;
+        const body = closeIdx === -1 ? text.slice(openEnd) : text.slice(openEnd, closeIdx);
+
+        const args = {};
+        const paramRe = /<parameter\s*=\s*([^\s/>]+)\s*>([\s\S]*?)<\/parameter\s*>/gi;
+        for (const param of body.matchAll(paramRe)) {
+            args[param[1].trim()] = trimParamValue(param[2]);
+        }
+
+        calls.push({ name, arguments: args });
+        spans.push([match.index, end]);
+    }
+    return { calls, spans };
+}
+
 /** Every format in one pass. `spans` cover all markup that should be hidden from users. */
 function collectAll(text, registry) {
     const source = typeof text === 'string' ? text : '';
@@ -490,6 +531,7 @@ function collectAll(text, registry) {
         extractCanonical(source),
         extractDsml(source),
         extractJsonWrapper(source),
+        extractFunctionEquals(source),
         extractTagNamed(source, names, schemas),
         extractBareJson(source, names)
     ];
@@ -590,7 +632,7 @@ export function parseExternalToolCallsFromText(registry, ...chunks) {
  * withheld from the client until we know what it is.
  */
 function markerOpeners(registry) {
-    const openers = ['<function_calls', '<tool_call', '<tool_calls', '<invoke', '<parameter', '<\uFF5C', '<|'];
+    const openers = ['<function_calls', '<function=', '<tool_call', '<tool_calls', '<invoke', '<parameter', '<\uFF5C', '<|'];
     registryNames(registry).forEach((name) => openers.push(`<${name.toLowerCase()}`));
     return openers;
 }
@@ -615,7 +657,7 @@ const INLINE_BLOCKS = [
  * channel that only receives the closer must drop it instead of printing it as prose.
  */
 const KNOWN_CLOSE_TAG = new RegExp(
-    `^</${MARK}(?:function_calls|tool_calls|tool_call|invoke|parameter)\\s*>`,
+    `^</${MARK}(?:function_calls|function|tool_calls|tool_call|invoke|parameter)\\s*>`,
     'i'
 );
 

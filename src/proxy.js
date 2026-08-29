@@ -1242,36 +1242,65 @@ export function createApp(config) {
                 scheduleIdleTimer();
             };
 
+            // Newer OpenCode servers stream deltas as `message.part.delta` events that
+            // carry only a `partID` (no `part.type`). The part type is announced by the
+            // preceding `message.part.updated` event, so we key partID -> type here and
+            // resolve each delta against it. Without this, reasoning and answer text can
+            // never be told apart and the answer is mis-routed (or dropped) entirely.
+            const partTypeById = new Map();
+            const rememberPartType = (part) => {
+                if (part && part.id && typeof part.type === 'string') {
+                    partTypeById.set(part.id, part.type);
+                }
+            };
+            const applyTextDelta = (partType, delta) => {
+                receivedDelta = true;
+                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                scheduleIdleTimer();
+                if (!firstDeltaAt) {
+                    firstDeltaAt = Date.now();
+                    logDebug('SSE first delta', {
+                        sessionId,
+                        ms: firstDeltaAt - startedAt,
+                        type: partType
+                    });
+                }
+                if (partType === 'reasoning') {
+                    reasoning += delta;
+                    if (onDelta) onDelta(delta, true);
+                } else {
+                    content += delta;
+                    if (onDelta) onDelta(delta, false);
+                }
+                deltaChars += delta.length;
+            };
+
             (async () => {
                 try {
                     for await (const event of eventStream) {
-                        if (event.type === 'message.part.updated' && event.properties.part.sessionID === sessionId) {
+                        if (event.type === 'message.part.updated' && event.properties.part?.sessionID === sessionId) {
                             const { part, delta } = event.properties;
+                            rememberPartType(part);
                             trackToolActivity(part);
-                            if (delta) {
-                                receivedDelta = true;
-                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                                scheduleIdleTimer();
-                                if (!firstDeltaAt) {
-                                    firstDeltaAt = Date.now();
-                                    logDebug('SSE first delta', {
-                                        sessionId,
-                                        ms: firstDeltaAt - startedAt,
-                                        type: part.type
-                                    });
+                            // Older OpenCode servers carried the streaming delta directly on
+                            // message.part.updated; newer servers emit message.part.delta.
+                            if (delta) applyTextDelta(part.type, delta);
+                            continue;
+                        }
+                        if (event.type === 'message.part.delta' && event.properties?.sessionID === sessionId) {
+                            const { partID, delta, field } = event.properties;
+                            // Text and reasoning deltas both stream through field === 'text'.
+                            // Tool-input deltas surface via message.part.updated tool state.
+                            if (typeof delta === 'string' && field === 'text') {
+                                const partType = partTypeById.get(partID);
+                                if (partType === 'reasoning' || partType === 'text') {
+                                    applyTextDelta(partType, delta);
                                 }
-                                if (part.type === 'reasoning') {
-                                    reasoning += delta;
-                                    if (onDelta) onDelta(delta, true);
-                                } else {
-                                    content += delta;
-                                    if (onDelta) onDelta(delta, false);
-                                }
-                                deltaChars += delta.length;
                             }
+                            continue;
                         }
                         if (event.type === 'message.updated' &&
-                            event.properties.info.sessionID === sessionId) {
+                            event.properties.info?.sessionID === sessionId) {
                             const info = event.properties.info;
                             const finish = info.finish;
                             // An aborted or failed message never produces another delta. Without
@@ -1294,6 +1323,7 @@ export function createApp(config) {
                             // detect pending tools even when only message.updated fires.
                             if (Array.isArray(info.parts)) {
                                 for (const part of info.parts) {
+                                    rememberPartType(part);
                                     if (part && part.type === 'tool') {
                                         const status = part.state?.status;
                                         if (status === 'pending' || status === 'running') {
@@ -1366,7 +1396,6 @@ export function createApp(config) {
                 let pID = 'opencode';
                 let mID = 'kimi-k2.5-free';
                 let id = `chatcmpl-${Date.now()}`;
-                let insideReasoning = false;
                 let keepaliveInterval = null;
 
                 try {
@@ -1567,7 +1596,6 @@ export function createApp(config) {
                     logDebug('Session created', { sessionId });
 
                     id = `chatcmpl-${Date.now()}`;
-                    insideReasoning = false;
                     keepaliveInterval = null;
                     let completionTokens = 0;
                     let reasoningTokens = 0;
@@ -1622,7 +1650,6 @@ export function createApp(config) {
                         let rawStreamedContent = '';
                         let rawStreamedReasoning = '';
                         const streamedToolCalls = [];
-                        insideReasoning = false;
                         keepaliveInterval = null;
                         completionTokens = 0;
                         reasoningTokens = 0;
@@ -1672,46 +1699,24 @@ export function createApp(config) {
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
                             if (isReasoning) {
-                                if (!insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id,
-                                        object: 'chat.completion.chunk',
-                                        created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{
-                                            index: 0,
-                                            delta: { content: '<think>\n' },
-                                            finish_reason: null
-                                        }]
-                                    })}\n\n`);
-                                    insideReasoning = true;
-                                }
                                 streamedReasoning += filtered;
                                 reasoningTokens += Math.ceil(filtered.length / 4);
                             } else {
-                                if (insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id,
-                                        object: 'chat.completion.chunk',
-                                        created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{
-                                            index: 0,
-                                            delta: { content: '\n</think>\n\n' },
-                                            finish_reason: null
-                                        }]
-                                    })}\n\n`);
-                                    insideReasoning = false;
-                                }
                                 streamedContent += filtered;
                                 completionTokens += Math.ceil(filtered.length / 4);
                             }
+                            // Reasoning and answer are streamed as separate fields so clients
+                            // that read `reasoning_content` (DeepSeek/Qwen-style) see the thinking
+                            // without it polluting `content`.
+                            const deltaField = isReasoning
+                                ? { reasoning_content: filtered }
+                                : { content: filtered };
                             const chunk = {
                                 id,
                                 object: 'chat.completion.chunk',
                                 created: Math.floor(Date.now() / 1000),
                                 model: `${pID}/${mID}`,
-                                choices: [{ index: 0, delta: { content: filtered }, finish_reason: null }]
+                                choices: [{ index: 0, delta: deltaField, finish_reason: null }]
                             };
                             res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                         };
@@ -1784,20 +1789,19 @@ export function createApp(config) {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
-                        }
-
-                        if (insideReasoning) {
-                            res.write(`data: ${JSON.stringify({
-                                id,
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: `${pID}/${mID}`,
-                                choices: [{
-                                    index: 0,
-                                    delta: { content: '\n</think>\n\n' },
-                                    finish_reason: null
-                                }]
-                            })}\n\n`);
+                        } else if (streamedReasoning && !streamedContent) {
+                            // Reconciliation for reasoning models: the reasoning streamed but the
+                            // answer text never arrived because every delta was tagged as reasoning
+                            // (issue #9). The message snapshot separates the two correctly, so
+                            // recover the missing answer from it instead of returning empty content.
+                            logDebug('Reasoning streamed but no content, reconciling from snapshot', { sessionId });
+                            const snapshot = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS).catch(() => null);
+                            if (snapshot && snapshot.content) {
+                                const remainingContent = rawStreamedContent
+                                    ? snapshot.content.slice(rawStreamedContent.length)
+                                    : snapshot.content;
+                                if (remainingContent) sendDelta(remainingContent, false);
+                            }
                         }
 
                         // Flush held buffers from the stream parsers and filters before final batch parse.
@@ -1913,19 +1917,20 @@ export function createApp(config) {
                         const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
                         const totalTokens = promptTokens + completionTokensCalc + reasoningTokensCalc;
 
-                        let finalContent = safeContent;
-                        if (safeReasoning) {
-                            finalContent = `<think>\n${safeReasoning}\n</think>\n\n${safeContent}`;
-                        }
-
                         const publicValidatedToolCalls = toPublicToolCalls(validatedToolCalls);
-                        const assistantMessage = publicValidatedToolCalls.length > 0
-                            ? {
-                                role: 'assistant',
-                                content: finalContent || null,
-                                tool_calls: publicValidatedToolCalls
-                            }
-                            : { role: 'assistant', content: finalContent };
+                        // Reasoning is emitted in its own `reasoning_content` field so clients
+                        // can surface the thinking without it being wrapped in <think> tags and
+                        // mixed into the answer `content`.
+                        const assistantMessage = {
+                            role: 'assistant',
+                            content: publicValidatedToolCalls.length > 0
+                                ? (safeContent || null)
+                                : safeContent,
+                            ...(safeReasoning ? { reasoning_content: safeReasoning } : {})
+                        };
+                        if (publicValidatedToolCalls.length > 0) {
+                            assistantMessage.tool_calls = publicValidatedToolCalls;
+                        }
 
                         res.json({
                             id: `chatcmpl-${Date.now()}`,
@@ -1950,20 +1955,6 @@ export function createApp(config) {
                 } catch (error) {
                     console.error('[Proxy] API Error:', error.message);
                     console.error('[Proxy] Error details:', error);
-
-                    if (stream && typeof insideReasoning !== 'undefined' && insideReasoning) {
-                        res.write(`data: ${JSON.stringify({
-                            id,
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: `${pID}/${mID}`,
-                            choices: [{
-                                index: 0,
-                                delta: { content: '\n\n' },
-                                finish_reason: null
-                            }]
-                        })}\n\n`);
-                    }
 
                     if (keepaliveInterval) clearInterval(keepaliveInterval);
 

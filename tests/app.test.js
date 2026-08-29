@@ -312,6 +312,58 @@ describe('Proxy OpenAI API', () => {
         expect(sdkMocks.toolIds).not.toHaveBeenCalled();
     });
 
+    test('POST /v1/chat/completions parses <function=name>/<parameter=key> tool markup and normalizes the tool name', async () => {
+        // Regression test for issue #6: models emit their native <function=webfetch> dialect
+        // (with a name that drops the request's underscore) inside <tool_call> markup. This
+        // must surface as a proper OpenAI `tool_calls` array with `finish_reason: tool_calls`,
+        // with the reasoning separated into `reasoning_content` and the markup stripped from
+        // `content`.
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'reasoning', text: 'The user wants the page title. Use the fetch tool.' },
+                    {
+                        type: 'text',
+                        text: '<tool_call>\n<function=webfetch>\n<parameter=url>https://example.com</parameter>\n<parameter=format>html</parameter>\n</function>\n</tool_call>'
+                    }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Fetch https://example.com title' }],
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'web_fetch',
+                            description: 'Fetch a URL',
+                            parameters: {
+                                type: 'object',
+                                properties: {
+                                    url: { type: 'string' }
+                                },
+                                required: ['url']
+                            }
+                        }
+                    }
+                ]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].finish_reason).toEqual('tool_calls');
+        expect(res.body.choices[0].message.content).toBeNull();
+        expect(res.body.choices[0].message.reasoning_content).toContain('The user wants the page title');
+        expect(res.body.choices[0].message.tool_calls).toHaveLength(1);
+        expect(res.body.choices[0].message.tool_calls[0].function.name).toEqual('web_fetch');
+        expect(JSON.parse(res.body.choices[0].message.tool_calls[0].function.arguments)).toMatchObject({ url: 'https://example.com' });
+    });
+
     test('POST /v1/chat/completions enables internal allowlist tools when client tools are omitted', async () => {
         const internalApp = createApp({
             PORT: 10000,
@@ -779,6 +831,111 @@ describe('Proxy OpenAI API', () => {
         expect(res.text).toContain('data: [DONE]');
     });
 
+    test('POST /v1/chat/completions streaming separates reasoning and answer from message.part.delta events', async () => {
+        // Regression test for issue #9: newer OpenCode servers stream deltas as
+        // `message.part.delta` events that carry only a `partID`. The part type is announced
+        // by the preceding `message.part.updated` event. Without resolving the partID to its
+        // type, reasoning and answer text could not be told apart and the answer was dropped.
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            const sessionId = 'test-session-id';
+            const mockEvents = [
+                {
+                    type: 'message.part.updated',
+                    properties: { part: { id: 'part-reasoning', type: 'reasoning', sessionID: sessionId } }
+                },
+                { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'part-reasoning', field: 'text', delta: '3+5=' } },
+                {
+                    type: 'message.part.updated',
+                    properties: { part: { id: 'part-text', type: 'text', sessionID: sessionId } }
+                },
+                { type: 'message.part.delta', properties: { sessionID: sessionId, partID: 'part-text', field: 'text', delta: '8' } },
+                { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+            ];
+            return {
+                stream: (async function* () {
+                    for (const event of mockEvents) yield event;
+                })()
+            };
+        });
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'What is 3+5?' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+
+        const deltas = [];
+        for (const line of res.text.split('\n')) {
+            if (!line.startsWith('data:') || line.includes('[DONE]')) continue;
+            const json = JSON.parse(line.slice(5).trim());
+            const delta = json.choices?.[0]?.delta;
+            if (delta) deltas.push(delta);
+        }
+        const reasoning = deltas.filter((d) => d.reasoning_content).map((d) => d.reasoning_content).join('');
+        const content = deltas.filter((d) => d.content).map((d) => d.content).join('');
+        expect(reasoning).toContain('3+5=');
+        expect(content).toContain('8');
+        expect(content).not.toContain('3+5=');
+    });
+
+    test('POST /v1/chat/completions streaming recovers answer from snapshot when every delta is tagged reasoning', async () => {
+        // Regression test for issue #9: some OpenCode servers tag every streaming delta as
+        // reasoning (even the final answer), leaving `content` empty. The message snapshot
+        // separates reasoning and text correctly, so the proxy reconciles the missing answer
+        // from the snapshot instead of returning an empty content.
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            const sessionId = 'test-session-id';
+            const mockEvents = [
+                { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: 'Let me think: ' } },
+                { type: 'message.part.updated', properties: { part: { type: 'reasoning', sessionID: sessionId }, delta: '8' } },
+                { type: 'message.updated', properties: { info: { sessionID: sessionId, finish: 'stop' } } }
+            ];
+            return {
+                stream: (async function* () {
+                    for (const event of mockEvents) yield event;
+                })()
+            };
+        });
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'reasoning', text: 'Let me think: ' },
+                    { type: 'text', text: '8' }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'What is 3+5?' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+
+        const deltas = [];
+        for (const line of res.text.split('\n')) {
+            if (!line.startsWith('data:') || line.includes('[DONE]')) continue;
+            const json = JSON.parse(line.slice(5).trim());
+            const delta = json.choices?.[0]?.delta;
+            if (delta) deltas.push(delta);
+        }
+        const reasoning = deltas.filter((d) => d.reasoning_content).map((d) => d.reasoning_content).join('');
+        const content = deltas.filter((d) => d.content).map((d) => d.content).join('');
+        expect(reasoning).toContain('Let me think');
+        // The answer must still reach the client even though the stream tagged it as reasoning.
+        expect(content).toContain('8');
+    });
+
     test('POST /v1/chat/completions streaming waits for internal tool execution instead of truncating', async () => {
         // Regression test for issue #3: a streaming response that triggers an internal tool
         // call (e.g. web_fetch) was truncated at the planning text. The collector resolved on
@@ -1017,7 +1174,7 @@ describe('Proxy OpenAI API', () => {
         expect(Date.now() - startedAt).toBeLessThan(5000);
     });
 
-    test('POST /v1/chat/completions includes reasoning tags in streaming', async () => {
+    test('POST /v1/chat/completions streams reasoning_content separately from content', async () => {
         const res = await request(app)
             .post('/v1/chat/completions')
             .set('Authorization', 'Bearer test-key')
@@ -1027,11 +1184,13 @@ describe('Proxy OpenAI API', () => {
                 stream: true
             });
 
-        expect(res.text).toContain('<think>');
-        expect(res.text).toContain('');
+        expect(res.text).toContain('reasoning_content');
+        // Reasoning must not be wrapped in <think> tags inside content.
+        expect(res.text).not.toContain('<think>');
+        expect(res.text).not.toContain('</think>');
     });
 
-    test('POST /v1/chat/completions streaming does not emit nonstandard reasoning_content field', async () => {
+    test('POST /v1/chat/completions streaming keeps reasoning out of content', async () => {
         const res = await request(app)
             .post('/v1/chat/completions')
             .set('Authorization', 'Bearer test-key')
@@ -1041,7 +1200,45 @@ describe('Proxy OpenAI API', () => {
                 stream: true
             });
 
-        expect(res.text).not.toContain('reasoning_content');
+        const deltas = [];
+        for (const line of res.text.split('\n')) {
+            if (!line.startsWith('data:') || line.includes('[DONE]')) continue;
+            const json = JSON.parse(line.slice(5).trim());
+            const delta = json.choices?.[0]?.delta;
+            if (delta) deltas.push(delta);
+        }
+        const reasoning = deltas.filter((d) => d.reasoning_content).map((d) => d.reasoning_content).join('');
+        const content = deltas.filter((d) => d.content).map((d) => d.content).join('');
+        expect(reasoning).toContain('Thinking');
+        expect(content).toContain('Mock response');
+        // Reasoning and answer must never bleed into each other.
+        expect(content).not.toContain('Thinking');
+        expect(reasoning).not.toContain('Mock');
+    });
+
+    test('POST /v1/chat/completions non-stream returns reasoning_content without think wrapping', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [
+                    { type: 'reasoning', text: 'Thinking process...' },
+                    { type: 'text', text: 'Plain assistant reply' }
+                ]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Test with reasoning' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].message.content).toEqual('Plain assistant reply');
+        expect(res.body.choices[0].message.reasoning_content).toEqual('Thinking process...');
+        expect(res.body.choices[0].message.content).not.toContain('<think>');
     });
 
     test('POST /v1/chat/completions supports reasoning_effort', async () => {

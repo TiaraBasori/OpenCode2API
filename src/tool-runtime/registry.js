@@ -114,8 +114,25 @@ export function buildExternalToolRegistry(tools, options = {}) {
 }
 
 export function findExternalToolByName(registry, name) {
-  if (!name || !Array.isArray(registry)) return null;
-  return registry.find((tool) => tool.namespacedName === name || tool.originalName === name) || null;
+    if (!name || !Array.isArray(registry)) return null;
+    const exact = registry.find((tool) => tool.namespacedName === name || tool.originalName === name);
+    if (exact) return exact;
+
+    // Models frequently drop separators or change case when emitting a tool name
+    // (e.g. the request declares `web_fetch` but the model writes `webfetch`).
+    // Fall back to a separator/case-insensitive match, but only when it is
+    // unambiguous — an exact match always wins and a tie resolves to nothing.
+    const normalized = normalizeToolNameForMatch(name);
+    if (!normalized) return null;
+    const matches = registry.filter((tool) =>
+        normalizeToolNameForMatch(tool.namespacedName) === normalized ||
+        normalizeToolNameForMatch(tool.originalName) === normalized
+    );
+    return matches.length === 1 ? matches[0] : null;
+}
+
+function normalizeToolNameForMatch(name) {
+    return String(name || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
 
 export function createRegistryIndex(registry) {

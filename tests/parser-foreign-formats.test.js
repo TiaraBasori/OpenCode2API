@@ -576,3 +576,33 @@ describe('rawCallsFromJsonText JSON scan fallback', () => {
         expect(args).toEqual({ command: 'echo hi' });
     });
 });
+
+describe('<function=name>/<parameter=key> markup (Qwen/GLM native dialect)', () => {
+    test('parses a <tool_call> block with <function=...> and <parameter=...> children', () => {
+        const text = '<tool_call>\n<function=bash>\n<parameter=command>ls -la</parameter>\n<parameter=description>list files</parameter>\n</function>\n</tool_call>';
+        const { name, args } = firstCall(parseExternalToolCallsFromText(registry, text));
+        expect(name).toBe('bash');
+        expect(args).toEqual({ command: 'ls -la', description: 'list files' });
+    });
+
+    test('normalizes a separator-dropped tool name to the registry name', () => {
+        // `web_fetch`-style mismatch: the model writes the name without the underscore.
+        const fetchRegistry = buildExternalToolRegistry([
+            { type: 'function', function: { name: 'web_fetch', parameters: { type: 'object', properties: { url: { type: 'string' } }, required: ['url'] } } }
+        ]);
+        const text = '<tool_call>\n<function=webfetch>\n<parameter=url>https://example.com</parameter>\n</function>\n</tool_call>';
+        const calls = parseExternalToolCallsFromText(fetchRegistry, text);
+        expect(calls).toHaveLength(1);
+        expect(calls[0].function.name).toBe('web_fetch');
+        expect(JSON.parse(calls[0].function.arguments)).toEqual({ url: 'https://example.com' });
+    });
+
+    test('strips the <function=...> block from visible text', () => {
+        const text = 'Let me run a command.\n<tool_call>\n<function=bash>\n<parameter=command>ls</parameter>\n</function>\n</tool_call>';
+        const stripped = stripFunctionCallMarkup(text);
+        expect(stripped).not.toContain('<function=');
+        expect(stripped).not.toContain('<parameter=');
+        expect(stripped).not.toContain('</function>');
+        expect(stripped).toContain('Let me run a command');
+    });
+});
