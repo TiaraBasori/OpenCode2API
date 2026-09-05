@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import { spawn } from 'child_process';
+import crypto from 'crypto';
 import { createOpencodeClient } from '@opencode-ai/sdk';
 import http from 'http';
 import https from 'https';
@@ -646,6 +647,56 @@ export function createApp(config) {
             console.log('[Proxy][Debug]', ...args);
         }
     };
+
+    // Responses API state store (previous_response_id): maps a returned response id
+    // to the OpenCode session that produced it, so stateful clients can continue a
+    // conversation without resending full history. Entries expire after
+    // RESPONSE_STATE_TTL_MS; the sweep then best-effort deletes the upstream session
+    // once no live entry still references it, so statefulness never leaks sessions.
+    const responseState = new Map();
+    const RESPONSE_STATE_TTL_MS = 30 * 60 * 1000;
+    const RESPONSE_STATE_SWEEP_INTERVAL_MS = 60 * 1000;
+    const getResponseState = (responseId) => {
+        const state = responseState.get(responseId);
+        if (!state) return null;
+        if (state.expiresAt <= Date.now()) {
+            responseState.delete(responseId);
+            return null;
+        }
+        return state;
+    };
+    const storeResponseState = (responseId, sessionId, model) => {
+        if (!responseId || !sessionId) return;
+        responseState.set(responseId, {
+            sessionId,
+            model,
+            expiresAt: Date.now() + RESPONSE_STATE_TTL_MS
+        });
+    };
+    const sweepResponseState = async () => {
+        const now = Date.now();
+        const expired = [];
+        for (const [id, state] of responseState.entries()) {
+            if (state.expiresAt <= now) {
+                expired.push(state);
+                responseState.delete(id);
+            }
+        }
+        if (!expired.length) return;
+        const liveSessionIds = new Set([...responseState.values()].map((s) => s.sessionId));
+        for (const state of expired) {
+            if (liveSessionIds.has(state.sessionId)) continue;
+            try {
+                await client.session.delete({ path: { id: state.sessionId } });
+            } catch (e) {
+                logDebug('Failed to delete expired response session', { sessionId: state.sessionId, error: e.message });
+            }
+        }
+    };
+    const responseStateSweepTimer = setInterval(() => {
+        sweepResponseState().catch(() => {});
+    }, RESPONSE_STATE_SWEEP_INTERVAL_MS);
+    if (typeof responseStateSweepTimer.unref === 'function') responseStateSweepTimer.unref();
 
     const TOOL_MODE = Object.freeze({
         DISABLED: 'disabled',
@@ -1446,7 +1497,7 @@ export function createApp(config) {
                 let stream = false;
                 let pID = 'opencode';
                 let mID = 'kimi-k2.5-free';
-                let id = `chatcmpl-${Date.now()}`;
+                let id = `chatcmpl-${crypto.randomUUID()}`;
                 let keepaliveInterval = null;
 
                 try {
@@ -1646,7 +1697,7 @@ export function createApp(config) {
                     if (!sessionId) throw new Error('Failed to create OpenCode session');
                     logDebug('Session created', { sessionId });
 
-                    id = `chatcmpl-${Date.now()}`;
+                    id = `chatcmpl-${crypto.randomUUID()}`;
                     keepaliveInterval = null;
                     let completionTokens = 0;
                     let reasoningTokens = 0;
@@ -2064,7 +2115,7 @@ export function createApp(config) {
                         }
 
                         res.json({
-                            id: `chatcmpl-${Date.now()}`,
+                            id: `chatcmpl-${crypto.randomUUID()}`,
                             object: 'chat.completion',
                             created: Math.floor(Date.now() / 1000),
                             model: `${pID}/${mID}`,
@@ -2205,9 +2256,9 @@ export function createApp(config) {
 
     app.post('/v1/responses', async (req, res) => {
         try {
-            const { 
-                model, 
-                input, 
+            const {
+                model,
+                input,
                 reasoning_effort,
                 reasoning: requestReasoning,
                 max_output_tokens,
@@ -2219,8 +2270,16 @@ export function createApp(config) {
                 stream = false,
                 messages: chatMessages,
                 prompt,
+                previous_response_id: previousResponseId,
                 opencode: requestOpencodeConfig
             } = req.body;
+
+            // Stateful continuation: reuse the session behind a previous response so the
+            // client only needs to send the new turn (OpenAI Responses API semantics).
+            const previousState = previousResponseId ? getResponseState(previousResponseId) : null;
+            if (previousResponseId && !previousState) {
+                return res.status(400).json({ error: { message: 'Invalid or expired previous_response_id' } });
+            }
 
             const reasoningLevel = normalizeReasoningEffort(
                 reasoning_effort || requestReasoning?.effort,
@@ -2360,7 +2419,7 @@ export function createApp(config) {
                 return res.status(400).json({ error: { message: 'input is required' } });
             }
 
-            const resolvedModel = await resolveRequestedModel(model);
+            const resolvedModel = await resolveRequestedModel(model || previousState?.model);
             const pID = resolvedModel.providerID;
             const mID = resolvedModel.modelID;
 
@@ -2372,10 +2431,15 @@ export function createApp(config) {
                 });
             } catch (e) { }
 
-            const sessionRes = await client.session.create();
-            const sessionId = sessionRes.data?.id;
+            // Continue the stored session when chaining from previous_response_id;
+            // otherwise start a fresh one.
+            let sessionId = previousState?.sessionId || null;
             if (!sessionId) {
-                throw new Error('Failed to create OpenCode session');
+                const sessionRes = await client.session.create();
+                sessionId = sessionRes.data?.id;
+                if (!sessionId) {
+                    throw new Error('Failed to create OpenCode session');
+                }
             }
 
             const parts = [];
@@ -2464,11 +2528,11 @@ export function createApp(config) {
                 res.setHeader('Content-Type', 'text/event-stream');
                 res.setHeader('Cache-Control', 'no-cache');
                 res.setHeader('Connection', 'keep-alive');
-                const responseId = `resp_${Date.now()}`;
+                const responseId = `resp_${crypto.randomUUID()}`;
                 const messageOutputIndex = 0;
                 const reasoningOutputIndex = 1;
                 const contentIndex = 0;
-                const outputItemId = `msg_${Date.now()}`;
+                const outputItemId = `msg_${crypto.randomUUID()}`;
                 const reasoningItemId = 'reasoning-0';
                 let nextOutputIndex = 2;
                 let sequenceNumber = 0;
@@ -2778,9 +2842,7 @@ export function createApp(config) {
                 };
                 emit({ type: 'response.completed', sequence_number: nextSeq(), response });
                 res.write('data: [DONE]\n\n');
-                try {
-                    await client.session.delete({ path: { id: sessionId } });
-                } catch (e) { }
+                storeResponseState(responseId, sessionId, `${pID}/${mID}`);
                 return res.end();
             }
 
@@ -2841,8 +2903,9 @@ export function createApp(config) {
                 output.push(buildResponsesFunctionCallOutputItem(toolCall));
             });
 
+            const responseId = `resp_${crypto.randomUUID()}`;
             const response = {
-                id: `resp_${Date.now()}`,
+                id: responseId,
                 object: 'response',
                 created: Math.floor(Date.now() / 1000),
                 model: `${pID}/${mID}`,
@@ -2857,9 +2920,7 @@ export function createApp(config) {
                 }
             };
 
-            try {
-                await client.session.delete({ path: { id: sessionId } });
-            } catch (e) { }
+            storeResponseState(responseId, sessionId, `${pID}/${mID}`);
 
             return res.json(response);
         } catch (error) {
