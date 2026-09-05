@@ -20,6 +20,54 @@ import {
 } from './tool-runtime/parser.js';
 
 /**
+ * Detect transient upstream provider failures that succeed on retry.
+ *
+ * The upstream (OpenCode Zen) occasionally mislabels throttling as billing
+ * errors: a worker hits its request limit and returns
+ * `401: {"message":"Insufficient balance...","type":"CreditsError"}` even
+ * though the account is fine — the very next attempt succeeds. These errors
+ * are surfaced to clients as bogus "insufficient balance" failures (issue #5).
+ * Match them (plus generic rate-limit/5xx signatures) so the proxy can retry
+ * with backoff before giving up.
+ * @param {Error|object|null} error - Assistant message error or thrown error
+ * @returns {boolean} true when the error looks transient
+ */
+function isTransientUpstreamError(error) {
+    if (!error) return false;
+    const message = [error.message, error.data?.message]
+        .filter((part) => typeof part === 'string')
+        .join(' ');
+    if (!message) return false;
+
+    const transientSignatures = [
+        /insufficient balance/i,
+        /credits?error/i,
+        /rate.?limit/i,
+        /too many requests/i,
+        /worker request limit/i,
+        /overloaded/i,
+        /temporarily unavailable/i,
+        /internal server error/i,
+        /bad gateway/i,
+        /service unavailable/i,
+        /stream error/i
+    ];
+    if (transientSignatures.some((re) => re.test(message))) return true;
+
+    // Upstream errors arrive as "<status>: {json}" strings; SDK errors may also
+    // carry a numeric status on the object itself.
+    const statusMatch = message.match(/\b(\d{3}):/);
+    const status = statusMatch
+        ? Number(statusMatch[1])
+        : (error.statusCode || error.data?.status || null);
+    if (typeof status === 'number') {
+        if (status === 401 || status === 402 || status === 429) return true;
+        if (status >= 500) return true;
+    }
+    return false;
+}
+
+/**
  * Transform upstream provider errors to OpenAI-compatible format
  * @param {Error} error - The error from the upstream provider
  * @returns {{statusCode: number, error: {message: string, type: string, code?: string}}} OpenAI-compatible error response
@@ -193,6 +241,9 @@ const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
+// Backoff base for transient upstream error retries (issue #5): 800ms, 1600ms.
+const RETRY_BACKOFF_BASE_MS = 800;
+const RETRY_MAX_ATTEMPTS = 3;
 // Reasoning models can take well over 10s before emitting their first token.
 // A short window here makes the event stream give up and fall back to polling on
 // every request, which loses true streaming. Configurable for slow backends.
@@ -1623,7 +1674,7 @@ export function createApp(config) {
                         promptParams.body.tools = toolOverrides;
                     }
 
-                    const requestForcedChatToolCall = createForcedToolCallRequester({
+                    const makeForcedChatToolCallRequester = () => createForcedToolCallRequester({
                         mode: externalToolChoice.mode,
                         sessionId,
                         systemWithGuard,
@@ -1634,6 +1685,7 @@ export function createApp(config) {
                         requestTimeoutMs: REQUEST_TIMEOUT_MS,
                         forbidThinkBlock: true
                     });
+                    let requestForcedChatToolCall = makeForcedChatToolCallRequester();
 
                     res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
                     res.setHeader('Cache-Control', 'no-cache');
@@ -1722,19 +1774,60 @@ export function createApp(config) {
                         };
 
                         let collected = null;
-                        try {
-                            const collectPromise = collectFromEvents(
-                                sessionId,
-                                REQUEST_TIMEOUT_MS,
-                                sendDelta,
-                                DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                DEFAULT_EVENT_IDLE_TIMEOUT_MS
-                            );
-                            const safeCollect = collectPromise.catch((err) => ({ __error: err }));
-                            client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
-                            collected = await safeCollect;
-                        } catch (e) {
-                            logDebug('Stream error:', e.message);
+                        for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+                            if (attempt > 1) {
+                                // Retry on a fresh session: the failed attempt left an errored
+                                // assistant message in the old one, and re-prompting the same
+                                // session would append a duplicate user turn to the context.
+                                // Safe to rotate because nothing has been streamed yet.
+                                try {
+                                    await client.session.delete({ path: { id: sessionId } });
+                                } catch (e) {
+                                    logDebug('Failed to delete retried session', { sessionId, error: e.message });
+                                }
+                                const retrySessionRes = await client.session.create();
+                                sessionId = retrySessionRes.data?.id;
+                                if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+                                promptParams.path.id = sessionId;
+                                requestForcedChatToolCall = makeForcedChatToolCallRequester();
+                                streamedContent = '';
+                                streamedReasoning = '';
+                                rawStreamedContent = '';
+                                rawStreamedReasoning = '';
+                                streamedToolCalls.length = 0;
+                                completionTokens = 0;
+                                reasoningTokens = 0;
+                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                            }
+                            try {
+                                const collectPromise = collectFromEvents(
+                                    sessionId,
+                                    REQUEST_TIMEOUT_MS,
+                                    sendDelta,
+                                    DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+                                    DEFAULT_EVENT_IDLE_TIMEOUT_MS
+                                );
+                                const safeCollect = collectPromise.catch((err) => ({ __error: err }));
+                                client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
+                                collected = await safeCollect;
+                            } catch (e) {
+                                logDebug('Stream error:', e.message);
+                            }
+
+                            const attemptError = collected?.error || collected?.__error || null;
+                            const nothingStreamed = !rawStreamedContent
+                                && !rawStreamedReasoning
+                                && streamedToolCalls.length === 0;
+                            if (
+                                attemptError
+                                && nothingStreamed
+                                && attempt < RETRY_MAX_ATTEMPTS
+                                && isTransientUpstreamError(attemptError)
+                            ) {
+                                console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, attemptError.data?.message || attemptError.message || attemptError.name || 'unknown');
+                                continue;
+                            }
+                            break;
                         }
 
                         if (collected && collected.__error) {
@@ -1885,10 +1978,48 @@ export function createApp(config) {
                         res.write('data: [DONE]\n\n');
                         res.end();
                     } else {
-                        const promptStart = Date.now();
-                        await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                        logDebug('Prompt sent', { sessionId, ms: Date.now() - promptStart });
-                        let { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        let content = '';
+                        let reasoning = '';
+                        let error = null;
+                        for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+                            if (attempt > 1) {
+                                // Retry on a fresh session: the failed attempt left an errored
+                                // assistant message in the old one, and re-prompting the same
+                                // session would append a duplicate user turn to the context.
+                                try {
+                                    await client.session.delete({ path: { id: sessionId } });
+                                } catch (e) {
+                                    logDebug('Failed to delete retried session', { sessionId, error: e.message });
+                                }
+                                const retrySessionRes = await client.session.create();
+                                sessionId = retrySessionRes.data?.id;
+                                if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+                                promptParams.path.id = sessionId;
+                                requestForcedChatToolCall = makeForcedChatToolCallRequester();
+                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                            }
+                            const attemptStart = Date.now();
+                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
+                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            content = collected.content || '';
+                            reasoning = collected.reasoning || '';
+                            error = collected.error || null;
+                            // Bounded retry for upstream throttling mislabeled as billing
+                            // errors (401 CreditsError etc.); only when nothing usable was
+                            // produced, so real failures still surface after RETRY_MAX_ATTEMPTS.
+                            if (
+                                error
+                                && !content
+                                && !reasoning
+                                && attempt < RETRY_MAX_ATTEMPTS
+                                && isTransientUpstreamError(error)
+                            ) {
+                                console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, error.data?.message || error.message || error.name || 'unknown');
+                                continue;
+                            }
+                            break;
+                        }
                         if (error && !content && !reasoning) {
                             return res.status(502).json({
                                 error: {
