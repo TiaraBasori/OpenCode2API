@@ -2222,4 +2222,54 @@ describe('Proxy OpenAI API', () => {
         expect(res.body.choices[0].message.content).toBe('Recovered response');
         expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
     });
+describe('Proxy Responses API previous_response_id', () => {
+    test('chains follow-up turns onto the stored session without recreating it', async () => {
+        sdkMocks.sessionMessages.mockReset();
+        sdkMocks.sessionMessages.mockResolvedValue([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Mock response' }]
+            }
+        ]);
+        sdkMocks.eventSubscribe.mockReset();
+        sdkMocks.sessionCreate.mockClear();
+        sdkMocks.sessionDelete.mockClear();
+        sdkMocks.configUpdate.mockClear();
+
+        const first = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ model: 'opencode/kimi-k2.5', input: 'Hello' });
+
+        expect(first.statusCode).toEqual(200);
+        expect(first.body.id).toMatch(/^resp_/);
+        expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+
+        const followUp = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                input: 'And a follow-up question',
+                previous_response_id: first.body.id
+            });
+
+        expect(followUp.statusCode).toEqual(200);
+        // The stored OpenCode session is reused; no new session, no teardown.
+        expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
+        expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
+        // Model falls back to the one recorded with the previous response.
+        const lastUpdate = sdkMocks.configUpdate.mock.calls.at(-1)?.[0];
+        expect(lastUpdate?.body?.activeModel).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.5' });
+    });
+
+    test('rejects an invalid previous_response_id', async () => {
+        const res = await request(app)
+            .post('/v1/responses')
+            .set('Authorization', 'Bearer test-key')
+            .send({ input: 'Hello', previous_response_id: 'resp_does-not-exist' });
+
+        expect(res.statusCode).toEqual(400);
+        expect(res.body.error.message).toContain('previous_response_id');
+    });
+});
 });
