@@ -2145,4 +2145,81 @@ describe('Proxy OpenAI API', () => {
         expect(res.statusCode).toEqual(200);
         expect(sentSystem).toContain('You MUST call external__read');
     });
+
+    test('streaming retries once on transient upstream CreditsError and recovers', async () => {
+        // Issue #5: upstream workers mislabel throttling as 401 "Insufficient balance"
+        // (CreditsError). The very next attempt succeeds, so the proxy must rotate the
+        // session and retry instead of surfacing the bogus billing error.
+        sdkMocks.sessionMessages.mockReset();
+        sdkMocks.sessionMessages.mockImplementation(async () => ([{
+            info: { role: 'assistant', finish: 'stop' },
+            parts: [{ type: 'text', text: 'Recovered response' }]
+        }]));
+        sdkMocks.eventSubscribe.mockReset();
+        sdkMocks.eventSubscribe.mockImplementationOnce(async () => {
+            const sessionId = 'test-session-id';
+            const mockEvents = [{
+                type: 'message.updated',
+                properties: {
+                    info: {
+                        sessionID: sessionId,
+                        error: { name: 'CreditsError', data: { message: '401: {"message":"Insufficient balance. Manage your billing here: https://example.ai","type":"CreditsError","param":"","code":null}' } }
+                    }
+                }
+            }];
+            return {
+                stream: (async function* () {
+                    for (const event of mockEvents) yield event;
+                })()
+            };
+        });
+        // Subsequent calls fall through to the default mock (successful stream).
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Hello' }],
+                stream: true
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.text).toContain('Recovered response');
+        expect(res.text).not.toContain('Insufficient balance');
+        // The failed attempt's session must have been rotated before retrying.
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
+    });
+
+    test('non-streaming retries once on transient upstream CreditsError and recovers', async () => {
+        // Same mislabeled billing failure, polling path: first snapshot reports the
+        // CreditsError with no usable content, the retry succeeds.
+        sdkMocks.sessionMessages.mockReset();
+        sdkMocks.sessionMessages
+            .mockResolvedValueOnce([{
+                info: {
+                    role: 'assistant',
+                    error: { name: 'CreditsError', data: { message: '401: Insufficient balance' } }
+                },
+                parts: []
+            }])
+            .mockResolvedValue([{
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{ type: 'text', text: 'Recovered response' }]
+            }]);
+        sdkMocks.eventSubscribe.mockReset();
+
+        const res = await request(app)
+            .post('/v1/chat/completions')
+            .set('Authorization', 'Bearer test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                messages: [{ role: 'user', content: 'Hello' }],
+                stream: false
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.choices[0].message.content).toBe('Recovered response');
+        expect(sdkMocks.sessionDelete).toHaveBeenCalledWith({ path: { id: 'test-session-id' } });
+    });
 });
