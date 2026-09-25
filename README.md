@@ -8,7 +8,7 @@
 
 简体中文 | [English](./README.en.md)
 
-把本地 [OpenCode](https://opencode.ai) 运行时转换为 OpenAI 兼容 API 网关，在任何 OpenAI 客户端中使用免费模型（GPT、Kimi、GLM、MiniMax 等）。
+把本地 [OpenCode](https://opencode.ai) 运行时转换为 OpenAI 兼容 API 网关，在任何客户端中使用不限量的 OpenCode Zen 免费模型。
 
 ## ✨ 功能特性
 
