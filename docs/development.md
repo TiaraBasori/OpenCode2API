@@ -1,92 +1,61 @@
 # 💻 开发指南
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
-</p>
-
----
-
 ## 📋 环境准备
 
-### Node.js 环境
-
 ```bash
-# Node.js 18+
-node --version
-
-# npm
-npm --version
-```
-
-### 安装依赖
-
-```bash
+node --version    # 需要 18+
 npm install
-```
 
-### 安装 OpenCode CLI
-
-```bash
-# Windows
+# 安装 OpenCode CLI
 npm install -g opencode-ai
-
-# Linux/macOS
-curl -fsSL https://opencode.ai/install | bash
+# 或 curl -fsSL https://opencode.ai/install | bash
 ```
 
----
-
-## 🚀 开发模式
-
-### 启动开发服务器
-
-```bash
-npm start
-```
-
-> 这将自动启动 OpenCode 后端 (如果需要) 并启动代理服务。
-
-### 配置本地 config.json
+## 🚀 本地运行
 
 ```bash
 cp config.json.example config.json
+npm start
 ```
 
----
+启动后会按需拉起 OpenCode 后端并启动代理服务。
 
 ## ✅ 测试
 
 | 命令 | 说明 |
 |:-----|:-----|
-| `npm test -- --runInBand` | 运行所有测试 |
-| `npm run test:unit` | 运行单元测试 |
-| `npm run test:integration` | 运行集成测试 |
+| `npm test` | 全部单元测试（Jest） |
+| `npm run test:integration` | 集成测试 |
 
-### Docker 测试
+Docker 环境验证：
 
 ```bash
-# 构建并运行
 docker compose up -d --build
-
-# 查看日志
 docker compose logs -f
 ```
 
----
+## 📂 项目结构
 
-## 📝 代码规范
-
-### 格式化
-
-项目使用 ESLint (如有配置):
-
-```bash
-npm run lint
+```
+OpenCode2API/
+├── index.js                  # 入口与配置加载
+├── src/
+│   ├── proxy.js              # 核心代理逻辑
+│   └── tool-runtime/         # 工具桥接运行时（contracts/parser/policy/registry/router/validator）
+├── tests/
+│   ├── app.test.js           # 单元测试
+│   ├── parser-foreign-formats.test.js
+│   ├── test-integration.sh   # 集成测试
+│   └── test-streaming-real.sh
+├── docs/                     # 文档
+├── entrypoint.sh             # Docker 入口脚本
+├── Dockerfile
+└── docker-compose.yml
 ```
 
-### 提交规范
+## 📝 提交规范
 
-使用 Conventional Commits:
+使用 [Conventional Commits](https://www.conventionalcommits.org/)：
 
 ```
 feat: add new feature
@@ -97,37 +66,14 @@ test: add tests
 chore: update build/ci
 ```
 
----
-
-## 📂 项目结构
-
-```
-OpenCode2API/
-├── src/
-│   └── proxy.js           # 核心代理逻辑
-├── tests/
-│   ├── app.test.js       # 单元测试
-│   ├── test-integration.sh   # 集成测试
-│   └── test-streaming-real.sh # 流式测试
-├── docs/                 # 文档
-├── index.js             # 入口文件
-├── package.json         # 项目配置
-├── Dockerfile           # Docker 镜像
-└── docker-compose.yml   # Docker Compose
-```
-
----
-
 ## 🔄 贡献流程
 
-1. ⭐ Fork 项目
-2. 🌿 创建功能分支: `git checkout -b feature/your-feature`
-3. 💾 提交更改: `git commit -m 'feat: add new feature'`
-4. 📤 推送分支: `git push origin feature/your-feature`
-5. 🔀 创建 Pull Request
+1. Fork 项目并创建功能分支：`git checkout -b feature/your-feature`
+2. 提交更改，确保 `npm test` 通过
+3. 推送分支并创建 Pull Request
 
----
+详见 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
 ## 📄 许可证
 
-MIT License - 详见 [LICENSE](../LICENSE.md)
+MIT License · 详见 [LICENSE](../LICENSE.md)

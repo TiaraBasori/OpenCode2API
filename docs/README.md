@@ -1,12 +1,6 @@
 # OpenCode2API 文档中心
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
-</p>
-
-> 欢迎查看 OpenCode2API 文档
-
----
+简体中文文档。英文介绍见 [README.en.md](../README.en.md)。
 
 ## 📚 目录
 
@@ -18,8 +12,6 @@
 | 🐳 [Docker Deployment](./docker.md) | Docker 部署指南 |
 | 🔧 [Troubleshooting](./troubleshooting.md) | 常见问题排查 |
 | 💻 [Development](./development.md) | 开发指南 |
-
----
 
 ## 🔗 相关链接
 

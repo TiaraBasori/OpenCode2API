@@ -1,62 +1,60 @@
 # ⚙️ 配置详解
 
-<p align="center">
-  <img src="https://img.shields.io/badge/version-1.5.0-blue" alt="Version">
-</p>
+配置优先级：**环境变量 > config.json > 默认值**。
 
----
-
-## 📌 配置方式
-
-> 配置优先级：**环境变量 > config.json > 默认值**
-
----
+环境变量统一使用 `OPENCODE_` 前缀；config.json 使用对应的短名（见下表）。
 
 ## 🔧 环境变量
 
-### 核心配置
+### 服务与认证
 
-| 变量 | 默认值 | 说明 |
-|:-----|:-------|:-----|
-| `PORT` / `OPENCODE_PROXY_PORT` | `10000` | 代理服务端口 |
-| `OPENCODE_SERVER_PORT` | `10001` | OpenCode 后端服务端口 |
-| `API_KEY` | - | Bearer Token 认证密钥 |
-| `BIND_HOST` | `0.0.0.0` | 绑定地址 |
-| `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
-| `OPENCODE_SERVER_PASSWORD` | - | OpenCode 后端密码 |
+| 环境变量 | config.json | 默认值 | 说明 |
+|:---------|:------------|:-------|:-----|
+| `OPENCODE_PROXY_PORT` / `PORT` | `PORT` | `10000` | 代理监听端口 |
+| `BIND_HOST` | `BIND_HOST` | `0.0.0.0` | 监听地址 |
+| `OPENCODE_SERVER_PORT` | - | `10001` | 后端端口，仅用于生成默认 `OPENCODE_SERVER_URL` |
+| `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
+| `OPENCODE_SERVER_PASSWORD` | `OPENCODE_SERVER_PASSWORD` | (空) | 后端认证密码 |
+| `API_KEY` | `API_KEY` | (空) | 代理的 Bearer 认证密钥，未配置则不鉴权 |
+| `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `false` | 由代理自动拉起并管理 OpenCode 后端进程（Docker 内由 entrypoint 管理，无需开启） |
+| `OPENCODE_PATH` | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
+| `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (空) | Zen API Key 透传 |
+| `OPENCODE_USE_ISOLATED_HOME` | `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
 
-### 功能配置
+### 工具控制
 
-| 变量 | 默认值 | 说明 |
-|:-----|:-------|:-----|
-| `DISABLE_TOOLS` | `true` | 禁用 OpenCode 工具调用 |
-| `OPENCODE_EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式；当前仅支持 `proxy-bridge` |
-| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 外部工具冲突隔离策略；当前仅支持 `namespace` |
-| `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `false` | 兼容旧开关；未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
-| `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `(none)` | 当请求未传入 `tools` 时允许使用的 OpenCode 内置工具列表，逗号分隔 |
-| `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED` | `true` | 输出 internal allowlist 模式的调试/指标日志 |
-| `OPENCODE_TOOL_DISCOVERY_FIXTURE` | `(none)` | 集成测试/本地调试用的固定后端工具 ID 列表，逗号分隔 |
-| `OPENCODE_HEALTH_DETAILS_ENABLED` | `true` | 控制 `/health/details` 是否暴露 |
-| `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `true` | 控制 `/health/details` 是否要求 Bearer 认证 |
-| `OPENCODE_METRICS_ENABLED` | `false` | 控制 Prometheus `/metrics` 是否暴露 |
-| `OPENCODE_METRICS_REQUIRE_AUTH` | `true` | 控制 `/metrics` 是否要求 Bearer 认证 |
-| `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
-| `PROMPT_MODE` | `standard` | 提示词处理模式 |
-| `OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
-| `AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储 |
-| `CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔 (毫秒) |
-| `CLEANUP_MAX_AGE_MS` | `86400000` | 最大存储时间 (毫秒) |
-| `REQUEST_TIMEOUT_MS` | `180000` | 请求超时时间 (毫秒) |
+| 环境变量 | config.json | 默认值 | 说明 |
+|:---------|:------------|:-------|:-----|
+| `OPENCODE_DISABLE_TOOLS` | `DISABLE_TOOLS` | `true` | 禁用 OpenCode 内置工具 |
+| `OPENCODE_EXTERNAL_TOOLS_MODE` | `EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 外部工具桥接模式，当前仅支持 `proxy-bridge` |
+| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` | `EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 同名工具冲突隔离策略，当前仅支持 `namespace` |
+| `OPENCODE_INTERNAL_ALLOWED_TOOLS` | `INTERNAL_ALLOWED_TOOLS` | (空) | 请求未带 `tools` 时放行的内置工具，逗号分隔 |
+| `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` | `INTERNAL_WEB_FETCH_ENABLED` | `false` | 旧开关：未显式配置 allowlist 时，启用后默认放行 `web_fetch` |
+| `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED` | `INTERNAL_TOOL_METRICS_ENABLED` | `true` | 输出 allowlist 模式的调试/指标日志 |
+| `OPENCODE_TOOL_DISCOVERY_FIXTURE` | `INTERNAL_TOOL_DISCOVERY_FIXTURE` | (空) | 测试/调试用固定后端工具 ID 列表，逗号分隔 |
 
-### 调试配置
+### 提示词与会话
 
-| 变量 | 默认值 | 说明 |
-|:-----|:-------|:-----|
-| `DEBUG` / `OPENCODE_PROXY_DEBUG` | `false` | 开启调试日志 |
-| `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
-| `OPENCODE_ZEN_API_KEY` | - | Zen API Key 透传 |
+| 环境变量 | config.json | 默认值 | 说明 |
+|:---------|:------------|:-------|:-----|
+| `OPENCODE_PROXY_PROMPT_MODE` | `PROMPT_MODE` | `standard` | `standard` 或 `plugin-inject` |
+| `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
+| `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储 |
+| `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔（毫秒） |
+| `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `CLEANUP_MAX_AGE_MS` | `86400000` | 会话最大保留时间（毫秒） |
+| `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `REQUEST_TIMEOUT_MS` | `180000` | 请求超时（毫秒） |
 
----
+### 诊断与调试
+
+| 环境变量 | config.json | 默认值 | 说明 |
+|:---------|:------------|:-------|:-----|
+| `OPENCODE_HEALTH_DETAILS_ENABLED` | `HEALTH_DETAILS_ENABLED` | `true` | 是否暴露 `/health/details` |
+| `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH` | `HEALTH_DETAILS_REQUIRE_AUTH` | `true` | `/health/details` 是否要求 Bearer 认证 |
+| `OPENCODE_METRICS_ENABLED` | `METRICS_ENABLED` | `false` | 是否暴露 `/metrics` |
+| `OPENCODE_METRICS_REQUIRE_AUTH` | `METRICS_REQUIRE_AUTH` | `true` | `/metrics` 是否要求 Bearer 认证 |
+| `OPENCODE_PROXY_DEBUG` | `DEBUG` | `false` | 调试日志 |
+| `OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS` | - | `30000` | 流式响应首个 delta 的超时 |
+| `OPENCODE2API_EVENT_IDLE_TIMEOUT_MS` | - | `8000` | 流式响应的空闲超时 |
 
 ## 📄 config.json 示例
 
@@ -68,61 +66,42 @@
     "DISABLE_TOOLS": true,
     "EXTERNAL_TOOLS_MODE": "proxy-bridge",
     "EXTERNAL_TOOLS_CONFLICT_POLICY": "namespace",
-    "INTERNAL_WEB_FETCH_ENABLED": false,
     "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
     "INTERNAL_TOOL_METRICS_ENABLED": true,
-    "INTERNAL_TOOL_DISCOVERY_FIXTURE": [],
     "USE_ISOLATED_HOME": false,
     "PROMPT_MODE": "standard",
     "OMIT_SYSTEM_PROMPT": false,
     "AUTO_CLEANUP_CONVERSATIONS": false,
     "CLEANUP_INTERVAL_MS": 43200000,
     "CLEANUP_MAX_AGE_MS": 86400000,
+    "REQUEST_TIMEOUT_MS": 180000,
     "DEBUG": false,
     "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
-    "OPENCODE_PATH": "opencode",
-    "REQUEST_TIMEOUT_MS": 180000
+    "OPENCODE_PATH": "opencode"
 }
 ```
 
----
+## 🛠️ 工具控制详解
 
-## 🛠️ 外部工具桥接
+### 外部工具桥接
 
-OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` 桥接到代理层，而不是把这些工具直接暴露为 OpenCode 内置工具。
-
-### 当前支持的模式
-
-| 配置项 | 支持值 | 说明 |
-|:------|:------|:-----|
-| `OPENCODE_EXTERNAL_TOOLS_MODE` / `EXTERNAL_TOOLS_MODE` | `proxy-bridge` | 由代理虚拟化外部工具，并返回 OpenAI-compatible tool calling 结果 |
-| `OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY` / `EXTERNAL_TOOLS_CONFLICT_POLICY` | `namespace` | 使用代理内部命名空间隔离同名冲突 |
-
-### 工具冲突策略
-
-- 外部客户端工具优先以“代理桥接”的方式参与对话。
-- OpenCode 内置工具仍按现有 `DISABLE_TOOLS` 机制管理，不会因为客户端传入同名工具而被误触发。
-- 代理内部会使用类似 `external__web_fetch` 的命名空间名避免冲突。
-- 这些内部命名空间名称不会作为公开 API 的一部分暴露给客户端。
+- 客户端传入的 `tools` 不会注册为 OpenCode 内置工具，由代理虚拟化后交给模型使用。
+- 模型输出会被整理为 OpenAI 兼容的 `tool_calls` / `function_call` 返回给客户端。
+- 同名冲突通过内部命名空间隔离（如 `external__web_fetch`），命名空间名是内部实现细节，不属于公开 API。
+- 一旦请求显式传入 `tools`，OpenCode 内置工具在该请求中保持禁用。
 
 ### 内置工具 allowlist
 
-- 当请求 **未传入** `tools` 时，代理会进入 internal allowlist 模式，只允许 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 中声明的 OpenCode 内置工具。
-- `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 仅用于兼容旧配置：如果未显式配置 allowlist，则默认把 allowlist 视为 `web_fetch`。
-- 代理会读取后端工具列表，并通过精确匹配或 `.<tool>` / `/<tool>` 后缀匹配解析最终可用工具。
-- 如果配置的 allowlist 在后端工具列表中一个也没有匹配到，代理会自动回退到“全部内置工具禁用”的安全模式。
-- `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true` 时，会输出 internal allowlist 模式的调试/指标日志，记录模式选择、后端工具发现、allowlist 命中情况和降级原因，但不会记录工具输出内容。
-- `OPENCODE_TOOL_DISCOVERY_FIXTURE` 可在集成测试或本地调试时绕过真实 `client.tool.ids()`，直接提供固定工具 ID 列表。
-- 一旦客户端传入 `tools`，请求立即切回外部工具桥接模式，所有 OpenCode 内置工具继续保持禁用。
+- 请求 **未传入** `tools` 时，代理进入 internal allowlist 模式，只允许 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 声明的内置工具。
+- 代理会读取后端工具列表，通过精确匹配或 `.<tool>` / `/<tool>` 后缀匹配解析最终可用工具。
+- allowlist 在后端一个都匹配不到时，自动回退为「全部内置工具禁用」的安全模式。
+- `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 是兼容旧配置的快捷方式：未显式配置 allowlist 时视为 `web_fetch`。
+- `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true` 时输出模式选择、工具发现、命中结果和降级原因的日志，不记录工具返回内容。
 
-### 请求级 allowlist 覆盖 (Request-Level Override)
+### 请求级 allowlist 覆盖
 
-在请求未传入 `tools` 的前提下，客户端可以在请求体中传入自定义字段 `opencode.internal_allowed_tools` 来覆盖服务端的默认内置工具列表。
-出于安全隔离原则，请求级覆盖**只能缩小（求交集），不能扩大**服务端的 allowlist 权限：
-- 如果请求了服务端未开启的内置工具，该工具会被自动忽略。
-- `effective_allowlist = intersection(server_allowlist, request_allowlist)`
+请求未传入 `tools` 时，可在请求体中传 `opencode.internal_allowed_tools` 覆盖服务端默认 allowlist。出于安全隔离，覆盖**只能缩小（求交集），不能扩大**：
 
-**示例：**
 ```json
 {
   "model": "opencode/kimi-k2.5",
@@ -133,21 +112,20 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 }
 ```
 
-### 结构化健康诊断接口
+## 📊 健康诊断与指标
 
-可以通过 `GET /health/details` 接口获取代理内部的运行状态与指标。这不仅有助于问题排查，也是用于编写集成行为测试的重要依据。
-- `OPENCODE_HEALTH_DETAILS_ENABLED=false` 时，接口返回 `404`。
-- `OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH=true` 时，接口要求 Bearer 认证；否则返回 `401`。
-返回值格式如下：
+- `/health` 始终是轻量健康检查。
+- `/health/details` 返回结构化诊断 JSON（`OPENCODE_HEALTH_DETAILS_ENABLED=false` 时返回 404，`OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH=true` 时要求认证）：
+
 ```json
 {
   "status": "ok",
   "proxy": true,
   "internal_tools": {
     "config": {
-      "allowed_tools": ["web_fetch", "filesystem"],
+      "allowed_tools": ["web_fetch"],
       "metrics_enabled": true,
-      "discovery_fixture": ["web_fetch", "filesystem", "bash"]
+      "discovery_fixture": []
     },
     "metrics": {
       "externalBridgeRequests": 12,
@@ -158,90 +136,48 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
     },
     "cache": {
       "tool_ids_cached": true,
-      "tool_id_count": 3,
+      "tool_id_count": 1,
       "age_ms": 12000
-    },
-    "audit": {
-      "available": true,
-      "fields": [
-        "requestedAllowlist",
-        "allowedToolNames",
-        "deniedRequestedTools",
-        "resolutionPath",
-        "resultingMode"
-      ]
     }
   }
 }
 ```
 
-### Prometheus 指标接口
+- `/metrics` 返回 Prometheus 文本格式（`OPENCODE_METRICS_ENABLED=false` 时返回 404）：
 
-可以通过 `GET /metrics` 获取 Prometheus 文本格式指标。
-- `OPENCODE_METRICS_ENABLED=false` 时，接口返回 `404`。
-- `OPENCODE_METRICS_REQUIRE_AUTH=true` 时，接口要求 Bearer 认证；否则返回 `401`。
-当前暴露的核心指标包括：
-- `opencode_internal_tool_mode_requests_total{mode="external_bridge"}`
-- `opencode_internal_tool_mode_requests_total{mode="internal_allowlist"}`
-- `opencode_internal_tool_mode_requests_total{mode="disabled"}`
-- `opencode_internal_tool_discovery_failures_total`
-- `opencode_internal_tool_fallback_disabled_total`
-- `opencode_internal_tool_cache_ids`
-
-### 推荐生产配置
-
-```bash
-DISABLE_TOOLS=true
-OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge
-OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY=namespace
-OPENCODE_INTERNAL_ALLOWED_TOOLS=web_fetch
-OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true
-OPENCODE_TOOL_DISCOVERY_FIXTURE=
-OPENCODE_HEALTH_DETAILS_ENABLED=true
-OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH=true
-OPENCODE_METRICS_ENABLED=false
-OPENCODE_METRICS_REQUIRE_AUTH=true
-OPENCODE_PROXY_PROMPT_MODE=plugin-inject
-OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
-OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
+```text
+opencode_internal_tool_mode_requests_total{mode="external_bridge"}
+opencode_internal_tool_mode_requests_total{mode="internal_allowlist"}
+opencode_internal_tool_mode_requests_total{mode="disabled"}
+opencode_internal_tool_discovery_failures_total
+opencode_internal_tool_fallback_disabled_total
+opencode_internal_tool_cache_ids
 ```
 
-
----
-
-## 🎯 Prompt Mode 说明
+## 🎯 Prompt Mode
 
 | 模式 | 说明 |
 |:-----|:-----|
-| **standard** (默认) | 标准模式，完整处理提示词 |
-| **plugin-inject** | 插件注入模式，减小模型侧提示词大小，通常与 `OMIT_SYSTEM_PROMPT=true` 配合使用 |
-
----
+| `standard`（默认） | 标准模式，完整处理提示词 |
+| `plugin-inject` | 插件注入模式，减小模型侧提示词大小，通常与 `OMIT_SYSTEM_PROMPT=true` 配合使用 |
 
 ## ⭐ 推荐配置
 
-### 🐳 Docker 生产环境
+### Docker 生产环境
 
-```bash
-DISABLE_TOOLS=true
-OPENCODE_EXTERNAL_TOOLS_MODE=proxy-bridge
-OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY=namespace
+```env
+API_KEY=your-secret-key
+OPENCODE_SERVER_PASSWORD=your-password
+OPENCODE_DISABLE_TOOLS=true
 OPENCODE_INTERNAL_ALLOWED_TOOLS=web_fetch
-OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true
-OPENCODE_TOOL_DISCOVERY_FIXTURE=
-OPENCODE_HEALTH_DETAILS_ENABLED=true
-OPENCODE_HEALTH_DETAILS_REQUIRE_AUTH=true
-OPENCODE_METRICS_ENABLED=false
-OPENCODE_METRICS_REQUIRE_AUTH=true
 OPENCODE_PROXY_PROMPT_MODE=plugin-inject
 OPENCODE_PROXY_OMIT_SYSTEM_PROMPT=true
 OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 ```
 
+### 本地开发
 
-### 💻 本地开发
-
-```bash
-DISABLE_TOOLS=false
+```env
+OPENCODE_DISABLE_TOOLS=false
 OPENCODE_PROXY_DEBUG=true
 ```
