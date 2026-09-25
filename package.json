@@ -1,6 +1,6 @@
 {
   "name": "opencode2api",
-  "version": "1.5.0",
+  "version": "2.0.0",
   "description": "An OpenAI-compatible API gateway for OpenCode Zen free models.",
   "main": "index.js",
   "type": "module",
