@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-09-25
+
 ### Added
 
 - **English README**: Added `README.en.md` with a language switch between the Chinese and English docs.
@@ -16,9 +18,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Integration Script**: `tests/integration/test-integration.sh` accepts `TEST_API_KEY`; the manual streaming smoke test now documents its usage and stays out of CI.
-
-### Changed
-
 - **Documentation Overhaul**: Rewrote the README and `docs/` for accuracy and concision; documented `previous_response_id` session chaining, the full environment-variable surface, and corrected env var names to match the implementation (`OPENCODE_DISABLE_TOOLS`, `OPENCODE_USE_ISOLATED_HOME`, `OPENCODE_PROXY_PROMPT_MODE`, etc.).
 - **Config Surface Consistency**: `.env.example`, `docker-compose.yml`, and the `Dockerfile` now set `OPENCODE_DISABLE_TOOLS` instead of `DISABLE_TOOLS`, which the proxy never read.
 
