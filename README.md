@@ -120,7 +120,7 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
 | `OPENCODE_USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
 | `OPENCODE_PROXY_DEBUG` | `false` | 调试日志 |
 
-> 📄 完整配置见 [配置详解](./docs/configuration.md)
+> 📄 完整配置见 [配置详解](./docs/zh/configuration.md)
 
 推荐生产配置：
 
@@ -147,7 +147,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 
 模型名称写法：`opencode/big-pickle`、`gpt5-nano`（自动解析为 `gpt-5-nano`）、`opencode/gpt5-nano`。
 
-> 📖 详见 [API 参考](./docs/api-reference.md)
+> 📖 详见 [API 参考](./docs/zh/api-reference.md)
 
 ## 🔧 故障排查
 
@@ -155,18 +155,18 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 - **模型找不到** — `curl http://127.0.0.1:10000/v1/models` 确认模型 ID
 - **没有推理输出** — 用 `stream: true` 的 Responses API，并传 `reasoning.effort`
 
-> 📖 更多见 [故障排查](./docs/troubleshooting.md)
+> 📖 更多见 [故障排查](./docs/zh/troubleshooting.md)
 
 ## 📚 文档
 
 | 文档 | 说明 |
 |:-----|:-----|
-| [快速开始](./docs/getting-started.md) | 安装与首次运行 |
-| [配置详解](./docs/configuration.md) | 全部环境变量与 config.json |
-| [API 参考](./docs/api-reference.md) | 端点、参数与错误码 |
-| [Docker 部署](./docs/docker.md) | 部署与运维 |
-| [故障排查](./docs/troubleshooting.md) | 常见问题 |
-| [开发指南](./docs/development.md) | 本地开发与测试 |
+| [快速开始](./docs/zh/getting-started.md) | 安装与首次运行 |
+| [配置详解](./docs/zh/configuration.md) | 全部环境变量与 config.json |
+| [API 参考](./docs/zh/api-reference.md) | 端点、参数与错误码 |
+| [Docker 部署](./docs/zh/docker.md) | 部署与运维 |
+| [故障排查](./docs/zh/troubleshooting.md) | 常见问题 |
+| [开发指南](./docs/zh/development.md) | 本地开发与测试 |
 
 ## 📄 许可证
 
