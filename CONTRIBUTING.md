@@ -78,9 +78,10 @@ npm start
 
 ## Testing
 
-- Unit tests: `npm run test:unit`
-- Integration tests: `npm run test:integration`
-- All tests: `npm test -- --runInBand`
+- Unit tests (`tests/unit/`): `npm run test:unit`
+- Integration tests (Docker, `tests/integration/`): `npm run test:integration`
+- Live streaming smoke test (manual, `tests/manual/`): `npm run test:stream`
+- All unit tests: `npm test`
 
 ## Code Review Process
 

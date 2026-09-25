@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **English README**: Added `README.en.md` with a language switch between the Chinese and English docs.
+- **English Docs**: Added full `docs/en/` translations of every guide; Chinese guides now live under `docs/zh/`.
+- **Test Layout**: Split tests into `tests/unit/`, `tests/integration/`, and `tests/manual/`; added `npm run test:stream` for the live streaming smoke test and scoped Jest to `tests/unit`.
+
+### Changed
+
+- **Integration Script**: `tests/integration/test-integration.sh` accepts `TEST_API_KEY`; the manual streaming smoke test now documents its usage and stays out of CI.
 
 ### Changed
 
