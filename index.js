@@ -79,6 +79,7 @@ const finalConfig = {
     OPENCODE_PATH: process.env.OPENCODE_PATH || fileConfig.OPENCODE_PATH || defaultConfig.OPENCODE_PATH,
     BIND_HOST: process.env.BIND_HOST || fileConfig.BIND_HOST || defaultConfig.BIND_HOST,
     DISABLE_TOOLS: parseBool(process.env.OPENCODE_DISABLE_TOOLS, parseBool(fileConfig.DISABLE_TOOLS, defaultConfig.DISABLE_TOOLS)),
+    SEND_TOOL_OVERRIDES: parseBool(process.env.OPENCODE2API_SEND_TOOL_OVERRIDES, parseBool(fileConfig.SEND_TOOL_OVERRIDES, false)),
     EXTERNAL_TOOLS_MODE: process.env.OPENCODE_EXTERNAL_TOOLS_MODE || fileConfig.EXTERNAL_TOOLS_MODE || defaultConfig.EXTERNAL_TOOLS_MODE,
     EXTERNAL_TOOLS_CONFLICT_POLICY: process.env.OPENCODE_EXTERNAL_TOOLS_CONFLICT_POLICY || fileConfig.EXTERNAL_TOOLS_CONFLICT_POLICY || defaultConfig.EXTERNAL_TOOLS_CONFLICT_POLICY,
     INTERNAL_WEB_FETCH_ENABLED: parseBool(process.env.OPENCODE_INTERNAL_WEB_FETCH_ENABLED, parseBool(fileConfig.INTERNAL_WEB_FETCH_ENABLED, defaultConfig.INTERNAL_WEB_FETCH_ENABLED)),
@@ -128,6 +129,7 @@ console.log(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 console.log(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
 console.log(`  - Zen API Key: ${finalConfig.ZEN_API_KEY ? 'Configured' : 'Not configured'}`);
 console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
+console.log(`  - Send Tool Overrides: ${finalConfig.SEND_TOOL_OVERRIDES ? 'Yes' : 'No (OpenCode Zen free tier compatible)'}`);
 console.log(`  - External Tools Mode: ${finalConfig.EXTERNAL_TOOLS_MODE}`);
 console.log(`  - External Tools Conflict Policy: ${finalConfig.EXTERNAL_TOOLS_CONFLICT_POLICY}`);
 console.log(`  - Internal web_fetch Enabled: ${finalConfig.INTERNAL_WEB_FETCH_ENABLED ? 'Yes' : 'No'}`);

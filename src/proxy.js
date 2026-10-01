@@ -9,6 +9,7 @@ import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { evaluateToolPolicy } from './tool-runtime/policy.js';
@@ -19,6 +20,8 @@ import {
     createToolCallFilter,
     createExternalToolCallStreamParser
 } from './tool-runtime/parser.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /**
  * Detect transient upstream provider failures that succeed on retry.
@@ -510,6 +513,7 @@ export function createApp(config) {
         REQUEST_TIMEOUT_MS,
         DEBUG,
         DISABLE_TOOLS,
+        SEND_TOOL_OVERRIDES = false,
         INTERNAL_WEB_FETCH_ENABLED,
         INTERNAL_ALLOWED_TOOLS = [],
         INTERNAL_TOOL_METRICS_ENABLED = true,
@@ -1075,6 +1079,18 @@ export function createApp(config) {
     };
 
     const getToolOverridesForMode = async (toolMode, internalContext = {}) => {
+        // OpenCode >= 1.18 rejects Zen free-tier requests that carry a per-request
+        // `tools` override map (`FreeTierError: free tier can only be used from
+        // within OpenCode`). The override map was how this proxy disabled internal
+        // tools; tool suppression now relies on the system prompt instead, so the
+        // field is omitted by default and only sent when explicitly opted in.
+        if (!SEND_TOOL_OVERRIDES) {
+            logInternalToolEvent('tool-overrides-skipped', {
+                toolMode,
+                reason: 'SEND_TOOL_OVERRIDES=false (OpenCode Zen free tier compatibility)'
+            });
+            return null;
+        }
         if (toolMode === TOOL_MODE.EXTERNAL_BRIDGE || toolMode === TOOL_MODE.DISABLED) {
             if (toolMode === TOOL_MODE.DISABLED) {
                 logInternalToolEvent('internal-tools-disabled', {
@@ -2961,6 +2977,66 @@ export function createApp(config) {
 // Backend management state (per-instance)
 const backendState = new Map();
 
+// Runtime tool lock. `permission.ask` denies every tool request and
+// `tool.execute.before` throws as a second line of defence, so no built-in
+// tool (bash, write, edit, ...) can ever execute. Crucially this does NOT
+// remove tools from the model-facing request, which is what OpenCode Zen's
+// free tier requires to stay enabled.
+const TOOL_LOCK_PLUGIN_SOURCE = `export const Opencode2apiToolLock = async () => ({
+    "permission.ask": async (_input, output) => {
+        output.status = "deny"
+    },
+    "tool.execute.before": async (input) => {
+        throw new Error('Tool "' + input.tool + '" is disabled by opencode2api')
+    },
+})
+export default Opencode2apiToolLock
+`;
+
+function toolLockPluginPath() {
+    const candidates = [
+        path.join(__dirname, '..', 'plugin', 'tool-lock.js'),
+        path.join(os.tmpdir(), 'opencode2api-tool-lock.js')
+    ];
+    for (const file of candidates) {
+        try {
+            fs.mkdirSync(path.dirname(file), { recursive: true });
+            fs.writeFileSync(file, TOOL_LOCK_PLUGIN_SOURCE, 'utf8');
+            return file;
+        } catch (e) { }
+    }
+    return null;
+}
+
+function buildToolLockConfig() {
+    try {
+        const file = toolLockPluginPath();
+        if (!file) {
+            console.warn('[Proxy] Unable to write tool-lock plugin to disk');
+            return undefined;
+        }
+
+        let base = {};
+        if (process.env.OPENCODE_CONFIG_CONTENT) {
+            try {
+                const parsed = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) base = parsed;
+            } catch (e) {
+                console.warn('[Proxy] Ignoring invalid OPENCODE_CONFIG_CONTENT:', e.message);
+            }
+        }
+
+        const plugins = Array.isArray(base.plugin) ? [...base.plugin] : [];
+        if (!plugins.includes(file)) plugins.push(file);
+
+        console.log('[Proxy] Internal tool lock active (plugin):', file);
+        return JSON.stringify({ ...base, plugin: plugins });
+    } catch (err) {
+        console.warn('[Proxy] Unable to prepare tool-lock plugin:', err.message);
+        return undefined;
+    }
+}
+
 /**
  * Backend Lifecycle Management
  */
@@ -2972,7 +3048,9 @@ async function ensureBackend(config) {
         ZEN_API_KEY,
         OPENCODE_SERVER_PASSWORD,
         MANAGE_BACKEND,
-        PROMPT_MODE
+        PROMPT_MODE,
+        DISABLE_TOOLS,
+        SEND_TOOL_OVERRIDES
     } = config;
     const stateKey = OPENCODE_SERVER_URL;
 
@@ -2985,6 +3063,15 @@ async function ensureBackend(config) {
     }
 
     const state = backendState.get(stateKey);
+
+    // Internal tools are disabled through a backend plugin rather than through
+    // the per-request `tools` map. The map (and OPENCODE_PERMISSION) both strip
+    // the tool list from the upstream request, and OpenCode Zen's free tier
+    // rejects any request that does not carry the full official tool set with
+    // "free tier can only be used from within OpenCode". A plugin keeps the
+    // tool list intact for the upstream check while refusing every tool
+    // execution at runtime, so built-in tools can never actually run.
+    const toolLockConfig = (DISABLE_TOOLS && !SEND_TOOL_OVERRIDES) ? buildToolLockConfig() : undefined;
 
     if (state.isStarting) {
         // Wait for startup to complete
@@ -3077,7 +3164,8 @@ async function ensureBackend(config) {
                     ...process.env,
                     HOME: fakeHome,
                     USERPROFILE: fakeHome,
-                    OPENCODE_PROJECT_DIR: workspace
+                    OPENCODE_PROJECT_DIR: workspace,
+                    ...(toolLockConfig ? { OPENCODE_CONFIG_CONTENT: toolLockConfig } : {})
                 };
 
                 if (PROMPT_MODE === 'plugin-inject') {
@@ -3100,7 +3188,8 @@ async function ensureBackend(config) {
             } else {
                 envVars = {
                     ...process.env,
-                    OPENCODE_PROJECT_DIR: workspace
+                    OPENCODE_PROJECT_DIR: workspace,
+                    ...(toolLockConfig ? { OPENCODE_CONFIG_CONTENT: toolLockConfig } : {})
                 };
                 console.log('[Proxy] Using real HOME for OpenCode (isolation disabled)');
             }
@@ -3214,6 +3303,9 @@ export function startProxy(options) {
             normalizeBool(process.env.OPENCODE_PROXY_MANAGE_BACKEND) ??
             true,
         DISABLE_TOOLS: disableTools,
+        SEND_TOOL_OVERRIDES: normalizeBool(options.SEND_TOOL_OVERRIDES) ??
+            normalizeBool(process.env.OPENCODE2API_SEND_TOOL_OVERRIDES) ??
+            false,
         EXTERNAL_TOOLS_MODE: externalToolsMode,
         EXTERNAL_TOOLS_CONFLICT_POLICY: externalToolsConflictPolicy,
         INTERNAL_WEB_FETCH_ENABLED: normalizeBool(options.INTERNAL_WEB_FETCH_ENABLED) ??
