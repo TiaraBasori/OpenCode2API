@@ -52,7 +52,12 @@ const defaultConfig = {
     OMIT_SYSTEM_PROMPT: parseBool(process.env.OPENCODE_PROXY_OMIT_SYSTEM_PROMPT, false),
     AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env.OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS, false),
     CLEANUP_INTERVAL_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_INTERVAL_MS) || 43200000,
-    CLEANUP_MAX_AGE_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || 86400000
+    CLEANUP_MAX_AGE_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || 86400000,
+    // Event-stream timeouts. These used to be environment-only, which made them
+    // easy to lose depending on how the process was started; they can now also
+    // live in config.json so every launch path picks them up.
+    EVENT_IDLE_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || 0,
+    EVENT_FIRST_DELTA_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || 0
 };
 
 // Load config from file
@@ -98,7 +103,10 @@ const finalConfig = {
     OMIT_SYSTEM_PROMPT: parseBool(process.env.OPENCODE_PROXY_OMIT_SYSTEM_PROMPT, parseBool(fileConfig.OMIT_SYSTEM_PROMPT, defaultConfig.OMIT_SYSTEM_PROMPT)),
     AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env.OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS, parseBool(fileConfig.AUTO_CLEANUP_CONVERSATIONS, defaultConfig.AUTO_CLEANUP_CONVERSATIONS)),
     CLEANUP_INTERVAL_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_INTERVAL_MS) || fileConfig.CLEANUP_INTERVAL_MS || defaultConfig.CLEANUP_INTERVAL_MS,
-    CLEANUP_MAX_AGE_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || fileConfig.CLEANUP_MAX_AGE_MS || defaultConfig.CLEANUP_MAX_AGE_MS
+    CLEANUP_MAX_AGE_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || fileConfig.CLEANUP_MAX_AGE_MS || defaultConfig.CLEANUP_MAX_AGE_MS,
+    // undefined => keep the library default (8000 / 30000)
+    EVENT_IDLE_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || parseInt(fileConfig.EVENT_IDLE_TIMEOUT_MS) || undefined,
+    EVENT_FIRST_DELTA_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || parseInt(fileConfig.EVENT_FIRST_DELTA_TIMEOUT_MS) || undefined
 };
 
 // Validate required configuration
@@ -147,6 +155,8 @@ console.log(`  - Omit System Prompt: ${finalConfig.OMIT_SYSTEM_PROMPT ? 'Yes' : 
 console.log(`  - Auto Cleanup Conversations: ${finalConfig.AUTO_CLEANUP_CONVERSATIONS ? 'Yes' : 'No'}`);
 console.log(`  - Cleanup Interval: ${finalConfig.CLEANUP_INTERVAL_MS}ms`);
 console.log(`  - Cleanup Max Age: ${finalConfig.CLEANUP_MAX_AGE_MS}ms`);
+console.log(`  - Event Idle Timeout: ${finalConfig.EVENT_IDLE_TIMEOUT_MS || 'default (8000)'}ms`);
+console.log(`  - Event First Delta Timeout: ${finalConfig.EVENT_FIRST_DELTA_TIMEOUT_MS || 'default (30000)'}ms`);
 console.log(`  - Debug: ${finalConfig.DEBUG ? 'Yes' : 'No'}`);
 
 // A rejected promise inside a request handler must not take the whole proxy down.

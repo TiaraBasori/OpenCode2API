@@ -527,7 +527,9 @@ export function createApp(config) {
         AUTO_CLEANUP_CONVERSATIONS,
         CLEANUP_INTERVAL_MS,
         CLEANUP_MAX_AGE_MS,
-        OPENCODE_HOME_BASE
+        OPENCODE_HOME_BASE,
+        EVENT_IDLE_TIMEOUT_MS = DEFAULT_EVENT_IDLE_TIMEOUT_MS,
+        EVENT_FIRST_DELTA_TIMEOUT_MS = DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS
     } = config;
 
     const app = express();
@@ -1871,8 +1873,8 @@ export function createApp(config) {
                                     sessionId,
                                     REQUEST_TIMEOUT_MS,
                                     sendDelta,
-                                    DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                    DEFAULT_EVENT_IDLE_TIMEOUT_MS
+                                    EVENT_FIRST_DELTA_TIMEOUT_MS,
+                                    EVENT_IDLE_TIMEOUT_MS
                                 );
                                 const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                                 client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
@@ -2698,8 +2700,8 @@ export function createApp(config) {
                         sessionId,
                         REQUEST_TIMEOUT_MS,
                         sendResponsesDelta,
-                        DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-                        DEFAULT_EVENT_IDLE_TIMEOUT_MS
+                        EVENT_FIRST_DELTA_TIMEOUT_MS,
+                        EVENT_IDLE_TIMEOUT_MS
                     );
                     const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                     client.session.prompt(promptParams).catch(err => logDebug('Responses prompt error:', err.message));
@@ -3350,7 +3352,9 @@ export function startProxy(options) {
             false,
         CLEANUP_INTERVAL_MS: Number.isFinite(cleanupIntervalMs) && cleanupIntervalMs > 0 ? cleanupIntervalMs : 12 * 60 * 60 * 1000,
         CLEANUP_MAX_AGE_MS: Number.isFinite(cleanupMaxAgeMs) && cleanupMaxAgeMs > 0 ? cleanupMaxAgeMs : 24 * 60 * 60 * 1000,
-        OPENCODE_HOME_BASE: options.OPENCODE_HOME_BASE || null
+        OPENCODE_HOME_BASE: options.OPENCODE_HOME_BASE || null,
+        EVENT_IDLE_TIMEOUT_MS: options.EVENT_IDLE_TIMEOUT_MS,
+        EVENT_FIRST_DELTA_TIMEOUT_MS: options.EVENT_FIRST_DELTA_TIMEOUT_MS
     };
 
     const { app } = createApp(config);
