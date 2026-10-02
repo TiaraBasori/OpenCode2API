@@ -16,9 +16,9 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 | `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode backend address |
 | `OPENCODE_SERVER_PASSWORD` | `OPENCODE_SERVER_PASSWORD` | (empty) | Backend auth password |
 | `API_KEY` | `API_KEY` | (empty) | Proxy Bearer key, no auth when unset |
-| `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `false` | Proxy starts and manages the OpenCode backend process (managed by entrypoint in Docker, no need to enable) |
+| `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `true` | Proxy starts and manages the OpenCode backend process, which loads the tool-lock plugin |
 | `OPENCODE_PATH` | `OPENCODE_PATH` | `opencode` | OpenCode binary path |
-| `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (empty) | Zen API key passthrough |
+| `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (empty) | Zen API key, passed to the managed backend as `OPENCODE_API_KEY` for paid models |
 | `OPENCODE_USE_ISOLATED_HOME` | `USE_ISOLATED_HOME` | `false` | Use an isolated OpenCode config directory |
 
 ### Tool Control
@@ -90,11 +90,16 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 - Same-name conflicts are isolated via an internal namespace (e.g. `external__web_fetch`). Namespace names are internal details, not public API.
 - Once a request passes `tools` explicitly, OpenCode built-in tools stay disabled for that request.
 
+### Tool-Lock Plugin
+
+OpenCode Zen free models only accept requests whose tool list matches the official client's; disabling tools per request gets rejected (`free tier can only be used from within OpenCode`). So the backend the proxy starts loads `plugin/opencode2api-tool-lock.js`: the tool list stays intact, the tool policy rides in the session title, and the plugin blocks tools at execution time.
+
+- With a backend you start yourself (`MANAGE_BACKEND=false`), add the absolute path of that file to the backend's `plugin` config. Otherwise the proxy falls back to per-request tool overrides and free models are rejected.
+
 ### Built-in Tool Allowlist
 
 - When a request has **no** `tools`, the proxy enters internal allowlist mode. Only tools in `OPENCODE_INTERNAL_ALLOWED_TOOLS` are allowed.
-- The proxy reads the backend tool list and resolves usable tools by exact match or `.<tool>` / `/<tool>` suffix match.
-- If the allowlist matches nothing on the backend, it falls back to a safe mode with all built-in tools disabled.
+- Tool names are compared ignoring case and underscores, so `web_fetch` matches OpenCode's `webfetch`.
 - `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` is a legacy shortcut: treated as `web_fetch` when no allowlist is set.
 - With `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true`, mode selection, tool discovery, match results, and fallback reasons are logged. Tool return content is not logged.
 

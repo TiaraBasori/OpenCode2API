@@ -20,6 +20,7 @@ const sdkMocks = {
         }
     })),
     configUpdate: jest.fn(async () => ({})),
+    configGet: jest.fn(async () => ({ data: { plugin: [] } })),
     toolIds: jest.fn(async () => ({
         data: ['web_fetch', 'filesystem', 'bash']
     })),
@@ -90,7 +91,12 @@ jest.unstable_mockModule('http', () => ({
             const response = {
                 statusCode: 200,
                 headers: {},
-                on: jest.fn()
+                resume: jest.fn(),
+                setEncoding: jest.fn(),
+                on: jest.fn((event, handler) => {
+                    if (event === 'data') handler('{"healthy":true}');
+                    if (event === 'end') handler();
+                })
             };
 
             callback(response);
@@ -108,7 +114,8 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     createOpencodeClient: jest.fn(() => ({
         config: {
             providers: sdkMocks.configProviders,
-            update: sdkMocks.configUpdate
+            update: sdkMocks.configUpdate,
+            get: sdkMocks.configGet
         },
         tool: {
             ids: sdkMocks.toolIds

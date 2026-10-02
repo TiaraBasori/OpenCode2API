@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Free Models Rejected (#17, #18)**: OpenCode Zen free models (all but `space-bunny-free`) refuse requests whose tool list differs from the official client's. Tools are no longer disabled per request; the backend loads `plugin/opencode2api-tool-lock.js`, the tool policy rides in the session title, and the plugin blocks tools at execution time. Internal allowlists keep working, and native calls to bridged external tools are steered back to the text contract.
+- **Docker Startup Hang (#17)**: The entrypoint's health probe ran `curl` without a timeout against `/health`, which is not an OpenCode API route; a connection made while the backend was still booting never returned. The proxy now starts and supervises the backend itself (`MANAGE_BACKEND` defaults to `true`) and probes `/global/health`.
+- **Backend Password**: `OPENCODE_SERVER_PASSWORD` and `OPENCODE_ZEN_API_KEY` are passed to the managed backend as environment variables; the old `--password` flag does not exist and kept the backend from starting.
+
+### Removed
+
+- `SEND_TOOL_OVERRIDES` / `OPENCODE2API_SEND_TOOL_OVERRIDES`: the proxy picks plugin or override mode by checking the backend's loaded plugins.
+
 ## [2.0.0] - 2026-09-25
 
 ### Added

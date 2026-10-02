@@ -256,6 +256,15 @@ const DEFAULT_EVENT_IDLE_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_IDLE
 
 const OPENCODE_BASENAME = 'opencode';
 
+// Backend plugin that enforces the proxy's tool policy (see plugin/ for details).
+const TOOL_LOCK_PLUGIN_FILE = 'opencode2api-tool-lock.js';
+const TOOL_LOCK_PLUGIN_PATH = path.join(__dirname, '..', 'plugin', TOOL_LOCK_PLUGIN_FILE);
+
+// Lowercase and drop separators so `web_fetch`, `WebFetch` and `webfetch` match.
+function normalizeToolName(name) {
+    return String(name || '').toLowerCase().replace(/[^a-z0-9./]/g, '');
+}
+
 function splitPathEnv() {
     const raw = process.env.PATH || '';
     return raw.split(path.delimiter).filter(Boolean);
@@ -450,13 +459,30 @@ function buildBackendAuthHeaders(password = '') {
     return { Authorization: `Basic ${token}` };
 }
 
-function checkHealth(serverUrl, password = '') {
+// `/global/health` is OpenCode's real health endpoint. `/health` is not an API
+// route: it falls through to the web UI handler, which may proxy to
+// app.opencode.ai and answers 200 even when the API is not usable.
+export function checkHealth(serverUrl, password = '') {
     return new Promise((resolve, reject) => {
         const headers = buildBackendAuthHeaders(password);
         const options = headers ? { headers } : undefined;
-        const req = http.get(`${serverUrl}/health`, options, (res) => {
-            if (res.statusCode === 200) resolve(true);
-            else reject(new Error(`Status ${res.statusCode}`));
+        const req = http.get(`${serverUrl}/global/health`, options, (res) => {
+            if (res.statusCode !== 200) {
+                res.resume();
+                reject(new Error(`Status ${res.statusCode}`));
+                return;
+            }
+            let body = '';
+            res.setEncoding('utf8');
+            res.on('data', (chunk) => { body += chunk; });
+            res.on('end', () => {
+                try {
+                    if (JSON.parse(body)?.healthy === true) resolve(true);
+                    else reject(new Error('Backend reported unhealthy'));
+                } catch (e) {
+                    reject(new Error('Unexpected health response'));
+                }
+            });
         });
         req.on('error', (e) => reject(e));
         req.setTimeout(2000, () => {
@@ -513,7 +539,6 @@ export function createApp(config) {
         REQUEST_TIMEOUT_MS,
         DEBUG,
         DISABLE_TOOLS,
-        SEND_TOOL_OVERRIDES = false,
         INTERNAL_WEB_FETCH_ENABLED,
         INTERNAL_ALLOWED_TOOLS = [],
         INTERNAL_TOOL_METRICS_ENABLED = true,
@@ -1038,9 +1063,13 @@ export function createApp(config) {
 
     const normalizeBackendToolIds = (ids = []) => ids.filter((id) => typeof id === 'string' && id.trim());
 
+    // Built-in OpenCode tool IDs have no separators (`webfetch`), while configs
+    // commonly spell them `web_fetch`; compare both sides in the same form.
     const matchesAllowedToolName = (toolId, allowedToolName) => {
-        if (!toolId || !allowedToolName) return false;
-        return toolId === allowedToolName || toolId.endsWith(`.${allowedToolName}`) || toolId.endsWith(`/${allowedToolName}`);
+        const id = normalizeToolName(toolId);
+        const name = normalizeToolName(allowedToolName);
+        if (!id || !name) return false;
+        return id === name || id.endsWith(`.${name}`) || id.endsWith(`/${name}`);
     };
 
     const resolveInternalAllowedToolIds = (ids = [], allowedToolNames = []) => {
@@ -1080,19 +1109,69 @@ export function createApp(config) {
         return overrides;
     };
 
-    const getToolOverridesForMode = async (toolMode, internalContext = {}) => {
-        // OpenCode >= 1.18 rejects Zen free-tier requests that carry a per-request
-        // `tools` override map (`FreeTierError: free tier can only be used from
-        // within OpenCode`). The override map was how this proxy disabled internal
-        // tools; tool suppression now relies on the system prompt instead, so the
-        // field is omitted by default and only sent when explicitly opted in.
-        if (!SEND_TOOL_OVERRIDES) {
-            logInternalToolEvent('tool-overrides-skipped', {
-                toolMode,
-                reason: 'SEND_TOOL_OVERRIDES=false (OpenCode Zen free tier compatibility)'
-            });
-            return null;
+    // Tool enforcement. OpenCode Zen's free tier rejects any request whose tool
+    // list differs from the official client's ("free tier can only be used from
+    // within OpenCode"), and a per-request `tools` map strips tools from that
+    // list. When the backend runs the opencode2api tool-lock plugin, the tool
+    // list is left intact and the policy travels in the session title instead;
+    // the plugin then refuses every tool the policy does not allow. Backends
+    // without the plugin fall back to the `tools` map, which keeps tools off but
+    // only works with models that skip the free-tier check.
+    const TOOL_LOCK_CHECK_MS = 60 * 1000;
+    let toolLockState = { loaded: false, checkedAt: 0, warned: false };
+
+    const isToolLockLoaded = async () => {
+        if (toolLockState.checkedAt && Date.now() - toolLockState.checkedAt < TOOL_LOCK_CHECK_MS) {
+            return toolLockState.loaded;
         }
+        let plugins;
+        try {
+            const res = await client.config.get();
+            plugins = Array.isArray(res?.data?.plugin) ? res.data.plugin : [];
+        } catch (e) {
+            // Backend unreachable: do not cache, the request will surface the error.
+            return toolLockState.loaded;
+        }
+        const loaded = plugins.some((spec) => typeof spec === 'string' && spec.replace(/\\/g, '/').endsWith(`/${TOOL_LOCK_PLUGIN_FILE}`));
+        if (!loaded && !toolLockState.warned) {
+            console.warn(`[Proxy] Backend at ${OPENCODE_SERVER_URL} does not load ${TOOL_LOCK_PLUGIN_FILE}; falling back to per-request tool overrides. OpenCode Zen free models reject those requests. Let the proxy start the backend (MANAGE_BACKEND=true) or add "${TOOL_LOCK_PLUGIN_PATH}" to the backend's "plugin" config.`);
+            toolLockState.warned = true;
+        }
+        toolLockState = { ...toolLockState, loaded, checkedAt: Date.now() };
+        return loaded;
+    };
+
+    const buildToolPolicy = (toolMode, internalContext = {}) => {
+        if (toolMode === TOOL_MODE.INTERNAL_ALLOWLIST) {
+            const names = normalizeConfiguredToolNames(internalContext.allowedToolNames || SERVER_INTERNAL_ALLOWED_TOOL_NAMES)
+                .map(normalizeToolName)
+                .filter(Boolean);
+            return names.length ? [...new Set(names)].join(',') : 'none';
+        }
+        return DISABLE_TOOLS ? 'none' : '*';
+    };
+
+    const sessionTitleForPolicy = (policy) => `opencode2api [tools:${policy}]`;
+
+    // Resolves how a request's tool policy reaches the backend: a session title
+    // for the tool-lock plugin, or a `tools` override map as the fallback.
+    const resolveToolControl = async (toolMode, internalContext = {}) => {
+        const policy = buildToolPolicy(toolMode, internalContext);
+        if (await isToolLockLoaded()) {
+            logInternalToolEvent('tool-policy-plugin', { toolMode, policy });
+            return { title: sessionTitleForPolicy(policy), toolOverrides: null };
+        }
+        return { title: undefined, toolOverrides: await getToolOverridesForMode(toolMode, internalContext) };
+    };
+
+    const createSession = async (toolControl) => {
+        const sessionRes = await client.session.create(toolControl?.title ? { body: { title: toolControl.title } } : undefined);
+        const sessionId = sessionRes?.data?.id;
+        if (!sessionId) throw new Error('Failed to create OpenCode session');
+        return sessionId;
+    };
+
+    const getToolOverridesForMode = async (toolMode, internalContext = {}) => {
         if (toolMode === TOOL_MODE.EXTERNAL_BRIDGE || toolMode === TOOL_MODE.DISABLED) {
             if (toolMode === TOOL_MODE.DISABLED) {
                 logInternalToolEvent('internal-tools-disabled', {
@@ -1709,10 +1788,9 @@ export function createApp(config) {
                         logDebug('Failed to set active model:', confError.message);
                     }
 
-                    // Create session
-                    const sessionRes = await client.session.create();
-                    sessionId = sessionRes.data?.id;
-                    if (!sessionId) throw new Error('Failed to create OpenCode session');
+                    // Create session; with the tool-lock plugin its title carries the tool policy
+                    const toolControl = await resolveToolControl(toolMode, internalToolContext);
+                    sessionId = await createSession(toolControl);
                     logDebug('Session created', { sessionId });
 
                     id = `chatcmpl-${crypto.randomUUID()}`;
@@ -1738,7 +1816,7 @@ export function createApp(config) {
                             ...(requestParams.stop && { stop: requestParams.stop })
                         }
                     };
-                    const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
+                    const { toolOverrides } = toolControl;
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                         promptParams.body.tools = toolOverrides;
                     }
@@ -1854,9 +1932,7 @@ export function createApp(config) {
                                 } catch (e) {
                                     logDebug('Failed to delete retried session', { sessionId, error: e.message });
                                 }
-                                const retrySessionRes = await client.session.create();
-                                sessionId = retrySessionRes.data?.id;
-                                if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+                                sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
                                 requestForcedChatToolCall = makeForcedChatToolCallRequester();
                                 streamedContent = '';
@@ -2060,9 +2136,7 @@ export function createApp(config) {
                                 } catch (e) {
                                     logDebug('Failed to delete retried session', { sessionId, error: e.message });
                                 }
-                                const retrySessionRes = await client.session.create();
-                                sessionId = retrySessionRes.data?.id;
-                                if (!sessionId) throw new Error('Failed to create OpenCode session for retry');
+                                sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
                                 requestForcedChatToolCall = makeForcedChatToolCallRequester();
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
@@ -2451,13 +2525,12 @@ export function createApp(config) {
 
             // Continue the stored session when chaining from previous_response_id;
             // otherwise start a fresh one.
+            // With the tool-lock plugin, a chained session keeps the policy it was
+            // created with, so toolControl.title only matters for new sessions.
+            const toolControl = await resolveToolControl(toolMode, internalToolContext);
             let sessionId = previousState?.sessionId || null;
             if (!sessionId) {
-                const sessionRes = await client.session.create();
-                sessionId = sessionRes.data?.id;
-                if (!sessionId) {
-                    throw new Error('Failed to create OpenCode session');
-                }
+                sessionId = await createSession(toolControl);
             }
 
             const parts = [];
@@ -2493,7 +2566,7 @@ export function createApp(config) {
                 requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
                 providerID: pID,
                 modelID: mID,
-                toolOverrides: await getToolOverridesForMode(toolMode, internalToolContext),
+                toolOverrides: toolControl.toolOverrides,
                 requestTimeoutMs: REQUEST_TIMEOUT_MS,
                 forbidThinkBlock: false
             });
@@ -2511,7 +2584,7 @@ export function createApp(config) {
                     ...(top_p !== undefined && { top_p })
                 }
             };
-            const toolOverrides = await getToolOverridesForMode(toolMode, internalToolContext);
+            const { toolOverrides } = toolControl;
             if (toolOverrides && Object.keys(toolOverrides).length > 0) {
                 promptParams.body.tools = toolOverrides;
             }
@@ -2979,64 +3052,21 @@ export function createApp(config) {
 // Backend management state (per-instance)
 const backendState = new Map();
 
-// Runtime tool lock. `permission.ask` denies every tool request and
-// `tool.execute.before` throws as a second line of defence, so no built-in
-// tool (bash, write, edit, ...) can ever execute. Crucially this does NOT
-// remove tools from the model-facing request, which is what OpenCode Zen's
-// free tier requires to stay enabled.
-const TOOL_LOCK_PLUGIN_SOURCE = `export const Opencode2apiToolLock = async () => ({
-    "permission.ask": async (_input, output) => {
-        output.status = "deny"
-    },
-    "tool.execute.before": async (input) => {
-        throw new Error('Tool "' + input.tool + '" is disabled by opencode2api')
-    },
-})
-export default Opencode2apiToolLock
-`;
-
-function toolLockPluginPath() {
-    const candidates = [
-        path.join(__dirname, '..', 'plugin', 'tool-lock.js'),
-        path.join(os.tmpdir(), 'opencode2api-tool-lock.js')
-    ];
-    for (const file of candidates) {
+// Merges the tool-lock plugin into OPENCODE_CONFIG_CONTENT for the backend the
+// proxy spawns, keeping any config the operator already passes that way.
+export function buildBackendConfigContent(existing = process.env.OPENCODE_CONFIG_CONTENT) {
+    let base = {};
+    if (existing) {
         try {
-            fs.mkdirSync(path.dirname(file), { recursive: true });
-            fs.writeFileSync(file, TOOL_LOCK_PLUGIN_SOURCE, 'utf8');
-            return file;
-        } catch (e) { }
-    }
-    return null;
-}
-
-function buildToolLockConfig() {
-    try {
-        const file = toolLockPluginPath();
-        if (!file) {
-            console.warn('[Proxy] Unable to write tool-lock plugin to disk');
-            return undefined;
+            const parsed = JSON.parse(existing);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) base = parsed;
+        } catch (e) {
+            console.warn('[Proxy] Ignoring invalid OPENCODE_CONFIG_CONTENT:', e.message);
         }
-
-        let base = {};
-        if (process.env.OPENCODE_CONFIG_CONTENT) {
-            try {
-                const parsed = JSON.parse(process.env.OPENCODE_CONFIG_CONTENT);
-                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) base = parsed;
-            } catch (e) {
-                console.warn('[Proxy] Ignoring invalid OPENCODE_CONFIG_CONTENT:', e.message);
-            }
-        }
-
-        const plugins = Array.isArray(base.plugin) ? [...base.plugin] : [];
-        if (!plugins.includes(file)) plugins.push(file);
-
-        console.log('[Proxy] Internal tool lock active (plugin):', file);
-        return JSON.stringify({ ...base, plugin: plugins });
-    } catch (err) {
-        console.warn('[Proxy] Unable to prepare tool-lock plugin:', err.message);
-        return undefined;
     }
+    const plugins = Array.isArray(base.plugin) ? [...base.plugin] : [];
+    if (!plugins.includes(TOOL_LOCK_PLUGIN_PATH)) plugins.push(TOOL_LOCK_PLUGIN_PATH);
+    return JSON.stringify({ ...base, plugin: plugins });
 }
 
 /**
@@ -3050,9 +3080,7 @@ async function ensureBackend(config) {
         ZEN_API_KEY,
         OPENCODE_SERVER_PASSWORD,
         MANAGE_BACKEND,
-        PROMPT_MODE,
-        DISABLE_TOOLS,
-        SEND_TOOL_OVERRIDES
+        PROMPT_MODE
     } = config;
     const stateKey = OPENCODE_SERVER_URL;
 
@@ -3065,15 +3093,6 @@ async function ensureBackend(config) {
     }
 
     const state = backendState.get(stateKey);
-
-    // Internal tools are disabled through a backend plugin rather than through
-    // the per-request `tools` map. The map (and OPENCODE_PERMISSION) both strip
-    // the tool list from the upstream request, and OpenCode Zen's free tier
-    // rejects any request that does not carry the full official tool set with
-    // "free tier can only be used from within OpenCode". A plugin keeps the
-    // tool list intact for the upstream check while refusing every tool
-    // execution at runtime, so built-in tools can never actually run.
-    const toolLockConfig = (DISABLE_TOOLS && !SEND_TOOL_OVERRIDES) ? buildToolLockConfig() : undefined;
 
     if (state.isStarting) {
         // Wait for startup to complete
@@ -3118,6 +3137,15 @@ async function ensureBackend(config) {
             } catch (e) { }
         }
 
+        // The tool-lock plugin keeps Zen free models usable (see plugin/), the
+        // server password protects the backend API, and the Zen key unlocks
+        // paid models. `opencode serve` reads all three from the environment.
+        const backendEnv = {
+            OPENCODE_CONFIG_CONTENT: buildBackendConfigContent(),
+            ...(OPENCODE_SERVER_PASSWORD ? { OPENCODE_SERVER_PASSWORD } : {}),
+            ...(ZEN_API_KEY ? { OPENCODE_API_KEY: ZEN_API_KEY } : {})
+        };
+
         const isWindows = process.platform === 'win32';
         const useIsolatedHome = typeof USE_ISOLATED_HOME === 'boolean'
             ? USE_ISOLATED_HOME
@@ -3141,6 +3169,7 @@ async function ensureBackend(config) {
             cwd = workspace;
             envVars = {
                 ...process.env,
+                ...backendEnv,
                 OPENCODE_PROJECT_DIR: workspace
             };
             console.log('[Proxy] Running on Windows, using standard user home directory');
@@ -3166,8 +3195,8 @@ async function ensureBackend(config) {
                     ...process.env,
                     HOME: fakeHome,
                     USERPROFILE: fakeHome,
-                    OPENCODE_PROJECT_DIR: workspace,
-                    ...(toolLockConfig ? { OPENCODE_CONFIG_CONTENT: toolLockConfig } : {})
+                    ...backendEnv,
+                    OPENCODE_PROJECT_DIR: workspace
                 };
 
                 if (PROMPT_MODE === 'plugin-inject') {
@@ -3190,8 +3219,8 @@ async function ensureBackend(config) {
             } else {
                 envVars = {
                     ...process.env,
-                    OPENCODE_PROJECT_DIR: workspace,
-                    ...(toolLockConfig ? { OPENCODE_CONFIG_CONTENT: toolLockConfig } : {})
+                    ...backendEnv,
+                    OPENCODE_PROJECT_DIR: workspace
                 };
                 console.log('[Proxy] Using real HOME for OpenCode (isolation disabled)');
             }
@@ -3218,9 +3247,6 @@ async function ensureBackend(config) {
         };
 
         const spawnArgs = ['serve', '--port', port, '--hostname', '127.0.0.1'];
-        if (ZEN_API_KEY) {
-            spawnArgs.push('--password', ZEN_API_KEY);
-        }
         state.process = spawn(opencodeBin, spawnArgs, spawnOptions);
 
         // Handle spawn errors
@@ -3305,9 +3331,6 @@ export function startProxy(options) {
             normalizeBool(process.env.OPENCODE_PROXY_MANAGE_BACKEND) ??
             true,
         DISABLE_TOOLS: disableTools,
-        SEND_TOOL_OVERRIDES: normalizeBool(options.SEND_TOOL_OVERRIDES) ??
-            normalizeBool(process.env.OPENCODE2API_SEND_TOOL_OVERRIDES) ??
-            false,
         EXTERNAL_TOOLS_MODE: externalToolsMode,
         EXTERNAL_TOOLS_CONFLICT_POLICY: externalToolsConflictPolicy,
         INTERNAL_WEB_FETCH_ENABLED: normalizeBool(options.INTERNAL_WEB_FETCH_ENABLED) ??

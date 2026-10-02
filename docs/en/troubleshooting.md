@@ -10,6 +10,10 @@ Set `OPENCODE_USE_ISOLATED_HOME=false` so OpenCode reuses the host login state:
 OPENCODE_USE_ISOLATED_HOME=false
 ```
 
+### Free models fail with `free tier can only be used from within OpenCode`
+
+The backend is not loading the tool-lock plugin. Let the proxy start the backend (default `MANAGE_BACKEND=true`), or add `plugin/opencode2api-tool-lock.js` to your own backend's `plugin` config.
+
 ### Model not found (`model_not_found`)
 
 Check the model ID against the backend:

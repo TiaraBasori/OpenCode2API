@@ -10,6 +10,10 @@
 OPENCODE_USE_ISOLATED_HOME=false
 ```
 
+### 免费模型报 `free tier can only be used from within OpenCode`
+
+后端没有加载工具锁插件。让代理自己拉起后端（默认 `MANAGE_BACKEND=true`），或把 `plugin/opencode2api-tool-lock.js` 加入自建后端的 `plugin` 配置。
+
 ### 模型不存在（`model_not_found`）
 
 确认模型 ID 与后端一致：

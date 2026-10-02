@@ -49,7 +49,6 @@ docker build -t my-opencode2api .
 # Run a single container
 docker run -d \
   -p 10000:10000 \
-  -p 10001:10001 \
   -e API_KEY=your-key \
   -e OPENCODE_SERVER_PASSWORD=your-password \
   -v opencode-data:/home/node/.local/share/opencode \

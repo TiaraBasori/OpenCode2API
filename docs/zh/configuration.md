@@ -16,9 +16,9 @@
 | `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | `OPENCODE_SERVER_PASSWORD` | (空) | 后端认证密码 |
 | `API_KEY` | `API_KEY` | (空) | 代理的 Bearer 认证密钥，未配置则不鉴权 |
-| `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `false` | 由代理自动拉起并管理 OpenCode 后端进程（Docker 内由 entrypoint 管理，无需开启） |
+| `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `true` | 由代理拉起并管理 OpenCode 后端进程，后端会加载工具锁插件 |
 | `OPENCODE_PATH` | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
-| `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (空) | Zen API Key 透传 |
+| `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (空) | Zen API Key，以 `OPENCODE_API_KEY` 传给代理拉起的后端，用于付费模型 |
 | `OPENCODE_USE_ISOLATED_HOME` | `USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
 
 ### 工具控制
@@ -90,11 +90,16 @@
 - 同名冲突通过内部命名空间隔离（如 `external__web_fetch`），命名空间名是内部实现细节，不属于公开 API。
 - 一旦请求显式传入 `tools`，OpenCode 内置工具在该请求中保持禁用。
 
+### 工具锁插件
+
+OpenCode Zen 免费模型只接受工具列表与官方客户端一致的请求，按请求关闭工具会被拒绝（`free tier can only be used from within OpenCode`）。因此代理拉起后端时会加载 `plugin/opencode2api-tool-lock.js`：工具列表保持原样，工具策略写在会话标题里，由插件在执行时拦截。
+
+- 使用自行启动的后端（`MANAGE_BACKEND=false`）时，需要把该文件的绝对路径加入后端配置的 `plugin` 列表，否则代理退回按请求关闭工具，免费模型会被拒绝。
+
 ### 内置工具 allowlist
 
 - 请求 **未传入** `tools` 时，代理进入 internal allowlist 模式，只允许 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 声明的内置工具。
-- 代理会读取后端工具列表，通过精确匹配或 `.<tool>` / `/<tool>` 后缀匹配解析最终可用工具。
-- allowlist 在后端一个都匹配不到时，自动回退为「全部内置工具禁用」的安全模式。
+- 工具名比较时忽略大小写和下划线，`web_fetch` 等同于 OpenCode 的 `webfetch`。
 - `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 是兼容旧配置的快捷方式：未显式配置 allowlist 时视为 `web_fetch`。
 - `OPENCODE_INTERNAL_TOOL_METRICS_ENABLED=true` 时输出模式选择、工具发现、命中结果和降级原因的日志，不记录工具返回内容。
 
