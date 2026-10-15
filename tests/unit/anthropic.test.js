@@ -602,4 +602,43 @@ describe('Proxy Anthropic Messages API', () => {
         expect(bearerOk.status).toEqual(200);
     });
 
+    test('anthropic edge: terminal assistant error maps to 502 api_error, not the raw error name', async () => {
+        sdkMocks.sessionMessages.mockResolvedValue([
+            {
+                info: { role: 'assistant', finish: 'error', error: { name: 'ProviderError', message: 'boom from upstream' } },
+                parts: []
+            }
+        ]);
+        const res = await request(app).post('/v1/messages')
+            .set('x-api-key', 'test-key')
+            .send({ model: 'opencode/kimi-k2.5', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] });
+        expect(res.status).toEqual(502);
+        expect(res.body.type).toEqual('error');
+        expect(res.body.error.type).toEqual('api_error');
+        expect(res.body.error.message).toContain('boom from upstream');
+    });
+
+    test('anthropic edge: tool_result preserves block.name / empty / is_error content when tool registry is absent', async () => {
+        const res = await request(app).post('/v1/messages')
+            .set('x-api-key', 'test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                max_tokens: 64,
+                messages: [
+                    { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'call_x', name: 'custom_tool', content: '', is_error: true }] }
+                ]
+            });
+        expect(res.status).toEqual(200);
+        const promptCall = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        const toolResultPart = promptCall.body.parts.map((p) => p.text).find((t) => t.startsWith('TOOL_RESULT:'));
+        expect(toolResultPart).toBeDefined();
+        const parsed = JSON.parse(toolResultPart.slice('TOOL_RESULT:'.length));
+        expect(parsed).toEqual({
+            tool_call_id: 'call_x',
+            name: 'custom_tool',
+            content: 'Tool execution error',
+            is_error: true
+        });
+    });
+
 });

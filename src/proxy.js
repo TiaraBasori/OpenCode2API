@@ -2570,11 +2570,12 @@ export function createApp(config) {
                                 if (role === 'assistant' && block.type === 'tool_use') {
                                     const name = findExternalToolByName(externalToolRegistry, block?.name)?.namespacedName || block?.name;
                                     if (!name) continue;
-                                    if (block?.id) assistantToolCalls.set(block.id, name);
+                                    const callId = block?.id || `call_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+                                    assistantToolCalls.set(callId, name);
                                     parts.push({
                                         type: 'text',
                                         text: `ASSISTANT: <function_calls>${JSON.stringify([{
-                                            id: block?.id || `call_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`,
+                                            id: callId,
                                             name,
                                             arguments: normalizeToolArguments(block?.input)
                                         }])}</function_calls>`
@@ -2583,15 +2584,27 @@ export function createApp(config) {
                                 }
 
                                 if (role === 'user' && block.type === 'tool_result') {
-                                    const text = normalizeToolResultContent(block?.content);
-                                    if (!text) continue;
+                                    const rawText = normalizeToolResultContent(block?.content);
+                                    const text = block?.is_error && !rawText ? 'Tool execution error' : rawText;
                                     const mappedTool = findExternalToolByName(externalToolRegistry, block?.name)
                                         || findExternalToolByName(externalToolRegistry, assistantToolCalls.get(block?.tool_use_id));
-                                    const toolName = mappedTool?.namespacedName || assistantToolCalls.get(block?.tool_use_id) || `${EXTERNAL_TOOL_PREFIX}unknown`;
+                                    const fallbackSingleTool = !block?.tool_use_id && assistantToolCalls.size === 1
+                                        ? Array.from(assistantToolCalls.values())[0]
+                                        : null;
+                                    const toolName = mappedTool?.namespacedName
+                                        || assistantToolCalls.get(block?.tool_use_id)
+                                        || block?.name
+                                        || fallbackSingleTool
+                                        || `${EXTERNAL_TOOL_PREFIX}unknown`;
                                     const toolCallId = block?.tool_use_id || `call_${toolName.replace(/[^a-zA-Z0-9_]/g, '_')}`;
                                     parts.push({
                                         type: 'text',
-                                        text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}`
+                                        text: `TOOL_RESULT: ${JSON.stringify({
+                                            tool_call_id: toolCallId,
+                                            name: toolName,
+                                            content: text,
+                                            ...(block?.is_error ? { is_error: true } : {})
+                                        })}`
                                     });
                                     continue;
                                 }
@@ -2818,6 +2831,14 @@ export function createApp(config) {
                         const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
                         const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
                         const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
+                        if (flushedReasoningText) {
+                            streamedReasoning += flushedReasoningText;
+                            reasoningTokens += Math.ceil(flushedReasoningText.length / 4);
+                        }
+                        if (flushedContentText) {
+                            streamedContent += flushedContentText;
+                            completionTokens += Math.ceil(flushedContentText.length / 4);
+                        }
                         const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
                         const finalContentText = rawStreamedContent + flushedContentText;
 
@@ -2954,7 +2975,9 @@ export function createApp(config) {
                             break;
                         }
                         if (error && !content && !reasoning) {
-                            return anthropicError(502, error.name || 'api_error', error.data?.message || error.message || 'OpenCode provider error');
+                            // 5xx keeps a normalized Anthropic type: upstream error
+                            // names (Error/OpenCodeError/...) are not valid types.
+                            return anthropicError(502, 'api_error', error.data?.message || error.message || 'OpenCode provider error');
                         }
                         const parsedToolCalls = externalToolRegistry.length > 0
                             ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
@@ -3007,13 +3030,20 @@ export function createApp(config) {
                         if (!res.headersSent) {
                             return anthropicError(400, 'model_not_found', error.message || `Model not found: ${req.body?.model}`);
                         }
+                        console.error('[Proxy] Anthropic model_not_found after headers were sent; cannot report a 400 error body');
                     }
                     if (!res.headersSent) {
                         const transformed = transformUpstreamError(error);
                         return res.status(transformed.statusCode).json({
                             type: 'error',
                             error: {
-                                type: transformed.error.code || transformed.error.type || 'api_error',
+                                // model_not_found is an Anthropic error type, not an
+                                // upstream error code; normalize the mapping so the
+                                // shape stays consistent instead of leaking a
+                                // provider-specific type on a 5xx.
+                                type: transformed.statusCode >= 500
+                                    ? 'api_error'
+                                    : (transformed.error.code || transformed.error.type || 'api_error'),
                                 message: transformed.error.message
                             }
                         });
