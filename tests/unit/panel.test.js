@@ -90,7 +90,7 @@ describe('Web Panel', () => {
         const htmlRes = await request(disabledApp).get('/panel');
         expect(htmlRes.statusCode).toEqual(404);
 
-        const jsonRes = await request(disabledApp).get('/panel/keys.json');
+        const jsonRes = await request(disabledApp).get('/panel/data.json');
         expect(jsonRes.statusCode).toEqual(404);
     });
 
@@ -109,27 +109,27 @@ describe('Web Panel', () => {
         expect(res.text).not.toContain('super-secret-zen-key');
     });
 
-    test('GET /panel/keys.json returns 401 without auth when API_KEY is set', async () => {
+    test('GET /panel/data.json returns 401 without auth when API_KEY is set', async () => {
         const panelApp = buildPanelApp();
 
-        const res = await request(panelApp).get('/panel/keys.json');
+        const res = await request(panelApp).get('/panel/data.json');
         expect(res.statusCode).toEqual(401);
     });
 
-    test('GET /panel/keys.json returns 401 on a wrong Bearer key', async () => {
+    test('GET /panel/data.json returns 401 on a wrong Bearer key', async () => {
         const panelApp = buildPanelApp();
 
         const res = await request(panelApp)
-            .get('/panel/keys.json')
+            .get('/panel/data.json')
             .set('Authorization', 'Bearer wrong-key');
         expect(res.statusCode).toEqual(401);
     });
 
-    test('GET /panel/keys.json returns models, health and uptime when authorized', async () => {
+    test('GET /panel/data.json returns models, health and uptime when authorized', async () => {
         const panelApp = buildPanelApp();
 
         const res = await request(panelApp)
-            .get('/panel/keys.json')
+            .get('/panel/data.json')
             .set('Authorization', 'Bearer test-key');
 
         expect(res.statusCode).toEqual(200);
@@ -147,13 +147,13 @@ describe('Web Panel', () => {
         expect(res.body.health.internal_tools.config.allowed_tools).toEqual([]);
     });
 
-    test('GET /panel/keys.json never exposes secret values', async () => {
+    test('GET /panel/data.json never exposes secret values', async () => {
         const panelApp = buildPanelApp({
             INTERNAL_ALLOWED_TOOLS: ['web_fetch']
         });
 
         const res = await request(panelApp)
-            .get('/panel/keys.json')
+            .get('/panel/data.json')
             .set('Authorization', 'Bearer test-key');
 
         expect(res.statusCode).toEqual(200);
@@ -168,11 +168,11 @@ describe('Web Panel', () => {
         // Disabled: both 404 regardless of auth
         const offApp = buildPanelApp({ WEB_PANEL_ENABLED: false });
         expect((await request(offApp).get('/panel').set('Authorization', 'Bearer test-key')).status).toEqual(404);
-        expect((await request(offApp).get('/panel/keys.json').set('Authorization', 'Bearer test-key')).status).toEqual(404);
+        expect((await request(offApp).get('/panel/data.json').set('Authorization', 'Bearer test-key')).status).toEqual(404);
 
         // Enabled + PUBLIC_DIAGNOSTICS: no-auth access to JSON, still no secrets
         const pubApp = buildPanelApp({ PUBLIC_DIAGNOSTICS: true });
-        const pubRes = await request(pubApp).get('/panel/keys.json');
+        const pubRes = await request(pubApp).get('/panel/data.json');
         expect(pubRes.status).toEqual(200);
         const pubSerialized = JSON.stringify(pubRes.body);
         expect(pubSerialized).not.toContain('test-key');
@@ -182,36 +182,36 @@ describe('Web Panel', () => {
         // Enabled + wrong key: HTML shell 200 but JSON 401
         const app2 = buildPanelApp({});
         expect((await request(app2).get('/panel').set('Authorization', 'Bearer wrong')).status).toEqual(200);
-        expect((await request(app2).get('/panel/keys.json').set('Authorization', 'Bearer wrong')).status).toEqual(401);
+        expect((await request(app2).get('/panel/data.json').set('Authorization', 'Bearer wrong')).status).toEqual(401);
 
         // non-GET methods must not bypass the auth middleware
-        expect((await request(app2).post('/panel/keys.json').set('Authorization', 'Bearer test-key')).status).toEqual(404);
-        expect((await request(app2).post('/panel/keys.json')).status).toEqual(401);
+        expect((await request(app2).post('/panel/data.json').set('Authorization', 'Bearer test-key')).status).toEqual(404);
+        expect((await request(app2).post('/panel/data.json')).status).toEqual(401);
     });
 
-    test('GET /panel/keys.json works without auth when API_KEY is empty', async () => {
+    test('GET /panel/data.json works without auth when API_KEY is empty', async () => {
         const panelApp = buildPanelApp({ API_KEY: '' });
 
-        const res = await request(panelApp).get('/panel/keys.json');
+        const res = await request(panelApp).get('/panel/data.json');
         expect(res.statusCode).toEqual(200);
         expect(Array.isArray(res.body.models)).toEqual(true);
     });
 
-    test('GET /panel/keys.json works without auth when PUBLIC_DIAGNOSTICS is true', async () => {
+    test('GET /panel/data.json works without auth when PUBLIC_DIAGNOSTICS is true', async () => {
         const panelApp = buildPanelApp({ PUBLIC_DIAGNOSTICS: true });
 
-        const res = await request(panelApp).get('/panel/keys.json');
+        const res = await request(panelApp).get('/panel/data.json');
         expect(res.statusCode).toEqual(200);
         expect(res.body.public_diagnostics).toEqual(true);
         expect(Array.isArray(res.body.models)).toEqual(true);
         expect(res.body.models.length).toBeGreaterThan(0);
     });
 
-    test('GET /panel/keys.json omits health details when diagnostics are disabled', async () => {
+    test('GET /panel/data.json omits health details when diagnostics are disabled', async () => {
         const panelApp = buildPanelApp({ HEALTH_DETAILS_ENABLED: false });
 
         const res = await request(panelApp)
-            .get('/panel/keys.json')
+            .get('/panel/data.json')
             .set('Authorization', 'Bearer test-key');
 
         expect(res.statusCode).toEqual(200);
@@ -219,12 +219,12 @@ describe('Web Panel', () => {
         expect(Array.isArray(res.body.models)).toEqual(true);
     });
 
-    test('GET /panel/keys.json degrades gracefully when the backend is unreachable', async () => {
+    test('GET /panel/data.json degrades gracefully when the backend is unreachable', async () => {
         sdkMocks.configProviders.mockRejectedValue(new Error('connect ECONNREFUSED'));
         const panelApp = buildPanelApp();
 
         const res = await request(panelApp)
-            .get('/panel/keys.json')
+            .get('/panel/data.json')
             .set('Authorization', 'Bearer test-key');
 
         expect(res.statusCode).toEqual(200);

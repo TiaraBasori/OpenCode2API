@@ -151,10 +151,10 @@ opencode_internal_tool_cache_ids
 
 可选的只读仪表盘，由代理自身提供，默认关闭；设 `OPENCODE_WEB_PANEL_ENABLED=true`（或在 config.json 中设 `"WEB_PANEL_ENABLED": true`）开启。
 
-- `GET /panel` — 自包含的深色主题 HTML 页面（无外部 CSS/JS，CSP 限定同源）。展示运行状态（状态、uptime、后端地址）、模型列表、用量统计（存在按 key 的用量数据时显示），以及来自 `/health/details` 的后端诊断（工具模式计数、工具 ID 缓存）。页面把输入的密钥保存在浏览器 localStorage，并用它请求 `GET /panel/keys.json`。
-- `GET /panel/keys.json` — 页面背后的 JSON 数据源：`models`、`health`（即 `/health/details` 的内容）、`uptime` 与 `backend_url`。永远不会返回 `OPENCODE_SERVER_PASSWORD`、`ZEN_API_KEY`、`API_KEY`、`API_KEYS` 的值。
+- `GET /panel` — 自包含的深色主题 HTML 页面（无外部 CSS/JS，CSP 限定同源）。展示运行状态（状态、uptime、后端地址）、模型列表，以及来自 `/health/details` 的后端诊断（工具模式计数、工具 ID 缓存）。页面把输入的密钥保存在浏览器 localStorage，并用它请求 `GET /panel/data.json`。
+- `GET /panel/data.json` — 页面背后的 JSON 数据源：`models`、`health`（即 `/health/details` 的内容）、`uptime` 与 `backend_url`。永远不会返回 `OPENCODE_SERVER_PASSWORD`、`ZEN_API_KEY`、`API_KEY`、`API_KEYS` 的值。
 
-认证规则与诊断端点一致：配置了 `API_KEY` 时，`/panel/keys.json` 要求 `Authorization: Bearer <API_KEY>`（HTML 页面本体 `/panel` 公开但不包含任何数据）；`PUBLIC_DIAGNOSTICS=true` 或 `API_KEY` 为空时免认证。面板关闭时两个路由都返回 404。
+认证规则与诊断端点一致：配置了 `API_KEY` 时，`/panel/data.json` 要求 `Authorization: Bearer <API_KEY>`（HTML 页面本体 `/panel` 公开但不包含任何数据）；`PUBLIC_DIAGNOSTICS=true` 或 `API_KEY` 为空时免认证。面板关闭时两个路由都返回 404。
 
 ## ⭐ 推荐配置
 

@@ -587,7 +587,7 @@ export function createApp(config) {
     // Auth middleware
     app.use((req, res, next) => {
         if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
-        if (req.path === '/panel' || req.path === '/panel/keys.json') {
+        if (req.path === '/panel' || req.path === '/panel/data.json') {
             // Disabled panel: the routes do not exist (404) regardless of auth.
             if (!WEB_PANEL_ENABLED) {
                 return res.status(404).json({
@@ -595,7 +595,7 @@ export function createApp(config) {
                 });
             }
             // Enabled: both GET endpoints gate themselves — /panel is a static
-            // shell without data, /panel/keys.json enforces the diagnostics
+            // shell without data, /panel/data.json enforces the diagnostics
             // auth (PUBLIC_DIAGNOSTICS / Bearer) inside its handler.
             if (req.method === 'GET') return next();
         }
@@ -2461,7 +2461,7 @@ export function createApp(config) {
 
     // --- Built-in Web Panel (optional, read-only) ---
     // GET /panel serves a self-contained HTML shell (no data, no secrets).
-    // The page's script fetches /panel/keys.json, which assembles everything
+    // The page's script fetches /panel/data.json, which assembles everything
     // from data the proxy already exposes: /v1/models, /health/details and
     // process.uptime(). It never returns OPENCODE_SERVER_PASSWORD,
     // ZEN_API_KEY, API_KEY or API_KEYS values.
@@ -2473,7 +2473,7 @@ export function createApp(config) {
             res.send(PANEL_HTML);
         });
 
-        app.get('/panel/keys.json', async (req, res) => {
+        app.get('/panel/data.json', async (req, res) => {
             if (!shouldAllowOperationalEndpoint(req, { enabled: true })) {
                 return res.status(401).json({ error: { message: 'Unauthorized' } });
             }
@@ -2484,8 +2484,7 @@ export function createApp(config) {
                 backend_url: OPENCODE_SERVER_URL,
                 public_diagnostics: PUBLIC_DIAGNOSTICS === true,
                 models: [],
-                health: null,
-                usage: null
+                health: null
             };
             try {
                 payload.models = buildModelsList(await getProvidersList());

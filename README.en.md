@@ -142,7 +142,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/health/details` | Structured diagnostics (toggle/auth configurable) |
 | `GET` | `/metrics` | Prometheus metrics (toggle/auth configurable) |
 | `GET` | `/panel` | Web Panel page (off by default; enable with `OPENCODE_WEB_PANEL_ENABLED=true`) |
-| `GET` | `/panel/keys.json` | Web Panel data feed (Bearer/PUBLIC_DIAGNOSTICS gated, never returns secret values) |
+| `GET` | `/panel/data.json` | Web Panel data feed (Bearer/PUBLIC_DIAGNOSTICS gated, never returns secret values) |
 | `GET` | `/v1/models` | Model list |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
@@ -155,7 +155,7 @@ Model names: `opencode/big-pickle`, `gpt5-nano` (auto-resolved to `gpt-5-nano`),
 
 Set `OPENCODE_WEB_PANEL_ENABLED=true` (or `"WEB_PANEL_ENABLED": true` in config.json) and open `http://127.0.0.1:10000/panel` in a browser for a read-only dashboard: runtime status (status/uptime/backend URL), the model list, and backend diagnostics (tool-mode counters, cache state). Dark theme, zero external dependencies — no external CSS/JS, CSP locked to same-origin.
 
-With `API_KEY` configured, enter the proxy key in the page (kept in the browser's localStorage and used to call `/panel/keys.json`); with `PUBLIC_DIAGNOSTICS=true` or no `API_KEY` no key is needed. When the panel is disabled both routes return 404, and the data feed never returns any secret values. See [Configuration](./docs/en/configuration.md).
+With `API_KEY` configured, enter the proxy key in the page (kept in the browser's localStorage and used to call `/panel/data.json`); with `PUBLIC_DIAGNOSTICS=true` or no `API_KEY` no key is needed. When the panel is disabled both routes return 404, and the data feed never returns any secret values. See [Configuration](./docs/en/configuration.md).
 
 ## 🔧 Troubleshooting
 

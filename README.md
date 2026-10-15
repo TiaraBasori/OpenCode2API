@@ -142,7 +142,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/health/details` | 结构化诊断（可配置开关/鉴权） |
 | `GET` | `/metrics` | Prometheus 指标（可配置开关/鉴权） |
 | `GET` | `/panel` | Web Panel 页面（默认关闭，`OPENCODE_WEB_PANEL_ENABLED=true` 开启） |
-| `GET` | `/panel/keys.json` | Web Panel 数据源（Bearer/PUBLIC_DIAGNOSTICS 门禁，永不返回密钥值） |
+| `GET` | `/panel/data.json` | Web Panel 数据源（Bearer/PUBLIC_DIAGNOSTICS 门禁，永不返回密钥值） |
 | `GET` | `/v1/models` | 模型列表 |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
@@ -155,7 +155,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 
 设 `OPENCODE_WEB_PANEL_ENABLED=true`（或在 config.json 设 `"WEB_PANEL_ENABLED": true`）后，浏览器访问 `http://127.0.0.1:10000/panel` 即可查看只读仪表盘：运行状态（状态/uptime/后端地址）、模型列表、后端诊断（工具模式计数、缓存状态）。页面深色主题、零外部依赖（无外链 CSS/JS，CSP 限定同源）。
 
-配置 `API_KEY` 后，在页面输入代理密钥即可（保存在浏览器 localStorage，用于请求 `/panel/keys.json`）；`PUBLIC_DIAGNOSTICS=true` 或未配置 `API_KEY` 时无需输入。面板关闭时两个路由均为 404，数据端点永远不会返回任何密钥值。详见 [配置详解](./docs/zh/configuration.md)。
+配置 `API_KEY` 后，在页面输入代理密钥即可（保存在浏览器 localStorage，用于请求 `/panel/data.json`）；`PUBLIC_DIAGNOSTICS=true` 或未配置 `API_KEY` 时无需输入。面板关闭时两个路由均为 404，数据端点永远不会返回任何密钥值。详见 [配置详解](./docs/zh/configuration.md)。
 
 ## 🔧 故障排查
 

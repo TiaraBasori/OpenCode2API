@@ -5,8 +5,8 @@
  * images. The CSP meta tag allows only same-origin fetches and inline
  * style/script, so the page cannot load anything from the outside. The shell
  * contains zero data (and zero secrets); the page's script fetches
- * /panel/keys.json with a Bearer key kept in localStorage and renders the
- * read-only status/models/usage/diagnostics view from it.
+ * /panel/data.json with a Bearer key kept in localStorage and renders the
+ * read-only status/models/diagnostics view from it.
  *
  * NOTE: this file is a template literal — it must not contain backticks or
  * "${" sequences, and the page script must not contain "</script>".
@@ -62,7 +62,7 @@ button:hover { background: #30363d; }
       <input id="auth-key" type="password" placeholder="Proxy API key" autocomplete="off" aria-label="Proxy API key">
       <button id="auth-save" type="button">Save &amp; load</button>
     </div>
-    <p class="muted">The key is kept in this browser's localStorage and sent as a Bearer token to /panel/keys.json.</p>
+    <p class="muted">The key is kept in this browser's localStorage and sent as a Bearer token to /panel/data.json.</p>
   </section>
   <p id="error-box" class="error" hidden></p>
   <section id="status-card" class="card" hidden>
@@ -74,13 +74,6 @@ button:hover { background: #30363d; }
     <div class="table-wrap"><table>
       <thead><tr><th>ID</th><th>Name</th><th>Owned by</th></tr></thead>
       <tbody id="models-body"></tbody>
-    </table></div>
-  </section>
-  <section id="usage-card" class="card" hidden>
-    <h2>Usage by key</h2>
-    <div class="table-wrap"><table>
-      <thead><tr><th>Key</th><th>Requests</th><th>Input tokens</th><th>Output tokens</th></tr></thead>
-      <tbody id="usage-body"></tbody>
     </table></div>
   </section>
   <section id="diag-card" class="card" hidden>
@@ -155,19 +148,6 @@ button:hover { background: #30363d; }
         $('models-count').textContent = String(models.length);
         show($('models-card'));
 
-        var usage = data && data.usage;
-        var byKey = usage && usage.byKey && typeof usage.byKey === 'object' ? usage.byKey : null;
-        var usageKeys = byKey ? Object.keys(byKey) : [];
-        if (usageKeys.length > 0) {
-            fillRows('usage-body', usageKeys.map(function (k) {
-                var entry = byKey[k] || {};
-                return [k, entry.requests, entry.input_tokens, entry.output_tokens];
-            }));
-            show($('usage-card'));
-        } else {
-            hide($('usage-card'));
-        }
-
         var health = (data && data.health) || {};
         var tools = health.internal_tools || {};
         var metrics = tools.metrics || {};
@@ -198,7 +178,7 @@ button:hover { background: #30363d; }
 
     function showAuth(message) {
         $('auth-error').textContent = message || '';
-        hide($('status-card')); hide($('models-card')); hide($('usage-card')); hide($('diag-card'));
+        hide($('status-card')); hide($('models-card')); hide($('diag-card'));
         show($('auth-box'));
         $('auth-key').focus();
     }
@@ -207,7 +187,7 @@ button:hover { background: #30363d; }
         var key = storedKey();
         var headers = {};
         if (key) headers['Authorization'] = 'Bearer ' + key;
-        fetch('/panel/keys.json', { headers: headers, cache: 'no-store' })
+        fetch('/panel/data.json', { headers: headers, cache: 'no-store' })
             .then(function (res) {
                 if (res.status === 401) {
                     showAuth('This panel requires the proxy API key.');
