@@ -108,6 +108,7 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
 | 环境变量 | 默认值 | 说明 |
 |:--------|:-------|:-----|
 | `API_KEY` | (空) | 代理的 Bearer 认证密钥 |
+| `OPENCODE_API_KEYS` | (空) | 多用户 API key 列表，`name:key` 逗号分隔（详见 [配置详解](./docs/zh/configuration.md)） |
 | `OPENCODE_SERVER_PASSWORD` | (空) | OpenCode 后端密码 |
 | `OPENCODE_PROXY_PORT` / `PORT` | `10000` | 代理端口 |
 | `OPENCODE_SERVER_PORT` | `10001` | 后端端口（未显式配置 `OPENCODE_SERVER_URL` 时生效） |
@@ -142,10 +143,15 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/v1/models` | 模型列表 |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
+| `GET` | `/admin/keys` | 多用户 key 列表与用量（管理员认证，配置 `API_KEYS` 后可用） |
+| `POST` | `/admin/keys` | 运行时新增用户 key（管理员认证） |
+| `DELETE` | `/admin/keys/:name` | 移除用户 key（管理员认证） |
 
 模型名称写法：`opencode/big-pickle`、`gpt5-nano`（自动解析为 `gpt-5-nano`）、`opencode/gpt5-nano`。
 
 > 📖 详见 [API 参考](./docs/zh/api-reference.md)
+>
+> 👥 多用户 key、分 key 用量统计与管理端点的完整说明见 [配置详解](./docs/zh/configuration.md#-多用户-api-keys)。
 
 ## 🔧 故障排查
 

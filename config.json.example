@@ -1,6 +1,10 @@
 {
     "PORT": 10000,
     "API_KEY": "your-secret-api-key",
+    "API_KEYS": [
+        { "name": "alice", "key": "sk-alice-..." },
+        { "key": "sk-bare-key-..." }
+    ],
     "BIND_HOST": "0.0.0.0",
     "DISABLE_TOOLS": true,
     "CHAT_SESSION_AFFINITY": false,

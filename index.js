@@ -1,4 +1,5 @@
 import { startProxy } from './src/proxy.js';
+import { parseApiKeysConfig } from './src/proxy.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -28,10 +29,35 @@ function parseToolAllowlist(value, fallback = []) {
     return fallback;
 }
 
+/**
+ * Normalize the optional multi-user API_KEYS value coming from env / config.json.
+ * Arrays pass through (each entry may be an object {name, key} or "name:key");
+ * strings are parsed as a comma-separated "name:key" / bare-key list (env-friendly).
+ * @param {*} value - Raw API_KEYS value
+ * @returns {Array|undefined} normalized array, or undefined when unset
+ */
+function parseApiKeysValue(value) {
+    if (value === undefined || value === null || value === '') return undefined;
+    if (Array.isArray(value)) {
+        return value
+            .map((entry) => (typeof entry === 'string'
+                ? entry.trim()
+                : (entry && typeof entry === 'object'
+                    ? { name: entry.name, key: entry.key }
+                    : entry)))
+            .filter((entry) => (typeof entry === 'string' ? entry !== '' : Boolean(entry)));
+    }
+    if (typeof value === 'string') {
+        return value.split(',').map((entry) => entry.trim()).filter(Boolean);
+    }
+    return undefined;
+}
+
 // Default configuration
 const defaultConfig = {
     PORT: parseInt(process.env.OPENCODE_PROXY_PORT) || 10000,
     API_KEY: '',
+    API_KEYS: parseApiKeysValue(process.env.OPENCODE_API_KEYS),
     OPENCODE_SERVER_URL: `http://127.0.0.1:${process.env.OPENCODE_SERVER_PORT || 10001}`,
     OPENCODE_SERVER_PASSWORD: process.env.OPENCODE_SERVER_PASSWORD || '',
     MANAGE_BACKEND: true,
@@ -71,6 +97,10 @@ if (fs.existsSync(configPath)) {
 const finalConfig = {
     PORT: parseInt(process.env.OPENCODE_PROXY_PORT) || parseInt(process.env.PORT) || fileConfig.PORT || defaultConfig.PORT,
     API_KEY: process.env.API_KEY || fileConfig.API_KEY || defaultConfig.API_KEY,
+    // env (OPENCODE_API_KEYS, comma-separated "name:key") > config.json
+    // (array of {name, key}) > default (env only). When neither source sets
+    // it, the field stays undefined and single-key mode is untouched.
+    API_KEYS: parseApiKeysValue(process.env.OPENCODE_API_KEYS) ?? parseApiKeysValue(fileConfig.API_KEYS) ?? defaultConfig.API_KEYS,
     OPENCODE_SERVER_URL: process.env.OPENCODE_SERVER_URL || fileConfig.OPENCODE_SERVER_URL || defaultConfig.OPENCODE_SERVER_URL,
     OPENCODE_SERVER_PASSWORD: process.env.OPENCODE_SERVER_PASSWORD || fileConfig.OPENCODE_SERVER_PASSWORD || defaultConfig.OPENCODE_SERVER_PASSWORD,
     MANAGE_BACKEND: parseBool(process.env.OPENCODE_PROXY_MANAGE_BACKEND, parseBool(fileConfig.MANAGE_BACKEND, defaultConfig.MANAGE_BACKEND)),
@@ -100,6 +130,21 @@ if (!finalConfig.OPENCODE_PATH) {
     process.exit(1);
 }
 
+// Fail fast on a malformed multi-user key configuration (duplicates, missing
+// keys, bad shapes) instead of discovering it per request. startProxy would
+// also surface this, but exiting here gives a clear startup error.
+try {
+    if (finalConfig.API_KEYS !== undefined) {
+        const parsedApiKeys = parseApiKeysConfig(finalConfig.API_KEYS);
+        if (parsedApiKeys.length > 0) {
+            console.log(`[Config] API_KEYS: ${parsedApiKeys.length} user key(s) configured (${parsedApiKeys.map((entry) => entry.name).join(', ')})`);
+        }
+    }
+} catch (error) {
+    console.error(error.message);
+    process.exit(1);
+}
+
 // Check if opencode is available
 import { execSync } from 'child_process';
 try {
@@ -120,6 +165,7 @@ console.log(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
 console.log(`  - Backend Password: ${finalConfig.OPENCODE_SERVER_PASSWORD ? 'Configured' : 'Not configured'}`);
 console.log(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 console.log(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
+console.log(`  - API Keys (multi-user): ${Array.isArray(finalConfig.API_KEYS) && finalConfig.API_KEYS.length > 0 ? `${finalConfig.API_KEYS.length} user key(s)` : 'Not configured'}`);
 console.log(`  - Zen API Key: ${finalConfig.ZEN_API_KEY ? 'Configured' : 'Not configured'}`);
 console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 console.log(`  - Chat Session Affinity: ${finalConfig.CHAT_SESSION_AFFINITY ? 'Yes' : 'No (new session per request)'}`);

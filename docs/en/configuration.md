@@ -15,7 +15,8 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 | `OPENCODE_SERVER_PORT` | - | `10001` | Backend port, only used to build default `OPENCODE_SERVER_URL` |
 | `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode backend address |
 | `OPENCODE_SERVER_PASSWORD` | `OPENCODE_SERVER_PASSWORD` | (empty) | Backend auth password |
-| `API_KEY` | `API_KEY` | (empty) | Proxy Bearer key, no auth when unset |
+| `API_KEY` | `API_KEY` | (empty) | Proxy Bearer key (also the admin credential for `/admin/keys`), no auth when unset |
+| `OPENCODE_API_KEYS` | `API_KEYS` | (empty) | Multi-user API key list: a comma-separated `name:key` string for env, a `[{name, key}]` array for config.json. See [Multi-user API Keys](#-multi-user-api-keys) |
 | `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `true` | Proxy starts and manages the OpenCode backend process, which loads the tool-lock plugin |
 | `OPENCODE_PATH` | `OPENCODE_PATH` | `opencode` | OpenCode binary path |
 | `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (empty) | Zen API key, passed to the managed backend as `OPENCODE_API_KEY` for paid models |
@@ -56,6 +57,10 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 {
     "PORT": 10000,
     "API_KEY": "your-secret-api-key",
+    "API_KEYS": [
+        { "name": "alice", "key": "sk-alice-..." },
+        { "key": "sk-bare-key-..." }
+    ],
     "BIND_HOST": "0.0.0.0",
     "DISABLE_TOOLS": true,
     "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
@@ -104,6 +109,115 @@ When a request has no `tools`, `opencode.internal_allowed_tools` in the request 
     "internal_allowed_tools": ["web_fetch"]
   }
 }
+```
+
+## 👥 Multi-user API Keys
+
+Besides the single `API_KEY`, you can configure a set of **named user keys** (`API_KEYS`) for multi-user distribution with per-key usage metering. Both can be configured at once:
+
+- A request matching any `API_KEYS` entry authenticates and is metered under that key's name;
+- Otherwise the request falls back to `API_KEY` (existing single-key deployments are unchanged);
+- Both empty → no auth (current behavior).
+
+### Configuration formats
+
+`OPENCODE_API_KEYS` (env) is a **comma-separated `name:key`** string (`=` also works as the separator):
+
+```env
+OPENCODE_API_KEYS=alice:sk-alice-xxxx,bob:sk-bob-xxxx,sk-bare-key-xxxx
+```
+
+config.json uses an `API_KEYS` array of `{name, key}` entries (`name` optional):
+
+```json
+{
+    "API_KEYS": [
+        { "name": "alice", "key": "sk-alice-xxxx" },
+        { "key": "sk-bare-key-xxxx" }
+    ]
+}
+```
+
+**Name semantics**:
+
+- Bare keys without a name are auto-named `key-N` (N = 1-based position of the entry in the list);
+- Names are the primary key for usage metering and `/admin/keys` and must be unique; key values must be unique too;
+- Duplicate names or duplicate keys **fail at startup** with an error instead of running misconfigured.
+
+### Authentication behavior
+
+- User keys carry exactly the same business-endpoint access (`/v1/chat/completions`, `/v1/responses`, ...) as `API_KEY`;
+- `/health/details` and `/metrics` auth semantics are unchanged (Bearer by default, public with `OPENCODE_PUBLIC_DIAGNOSTICS=true`; user keys and `API_KEY` both pass);
+- Deleting (revoking) a user key makes that key's requests fail with 401 immediately.
+
+### Admin endpoints (/admin/keys)
+
+Mounted only when at least one `API_KEYS` entry is configured. Every endpoint requires the **admin credential = `Bearer API_KEY`** (the legacy single admin key — user keys always get 401), and there is no `OPENCODE_PUBLIC_DIAGNOSTICS` bypass. With an empty `API_KEY` the admin surface answers `501` (unavailable).
+
+| Method | Path | Description |
+|:-----|:-----|:-----|
+| `GET` | `/admin/keys` | List all user keys with their usage |
+| `POST` | `/admin/keys` | Hot-add a key at runtime, body `{"name": "carol", "key": "sk-..."}`; duplicate name or key → `400` |
+| `DELETE` | `/admin/keys/:name` | Remove a key; unknown name → `404`, success → `204` |
+
+`GET /admin/keys` response example (`keyHint` shows only the last 4 characters; the full key is never retrievable):
+
+```json
+[
+  {
+    "name": "alice",
+    "keyHint": "…xxxx",
+    "requests": 12,
+    "promptTokens": 8451,
+    "completionTokens": 2210,
+    "totalTokens": 10661,
+    "lastUsedAt": 1789000000000,
+    "createdAt": 1788900000000
+  }
+]
+```
+
+### Usage accounting
+
+Usage lives in memory and resets on process restart (no persistence, by design):
+
+- **requests**: requests that authenticated and entered a business handler (`/v1/chat/completions`, `/v1/responses`); failed requests (4xx/5xx) also count;
+- **promptTokens / completionTokens**: accumulated for successful requests only, using the same `Math.ceil(chars / 4)` estimation as the response usage field; completionTokens include reasoning tokens;
+- **lastUsedAt / createdAt**: millisecond timestamps of the last use and of key creation (process start or runtime add).
+
+`/health/details` gains a `usage` field in multi-user mode (absent for single-key deployments, preserving the legacy snapshot shape):
+
+```json
+{
+  "status": "ok",
+  "proxy": true,
+  "usage": {
+    "byKey": {
+      "alice": {
+        "requests": 12,
+        "promptTokens": 8451,
+        "completionTokens": 2210,
+        "totalTokens": 10661,
+        "lastUsedAt": 1789000000000,
+        "createdAt": 1788900000000
+      }
+    },
+    "total": {
+      "requests": 12,
+      "promptTokens": 8451,
+      "completionTokens": 2210,
+      "totalTokens": 10661
+    }
+  }
+}
+```
+
+`/metrics` emits per-key Prometheus counters in multi-user mode:
+
+```text
+opencode_proxy_key_requests_total{key="alice"}
+opencode_proxy_key_tokens_total{key="alice",type="prompt"}
+opencode_proxy_key_tokens_total{key="alice",type="completion"}
 ```
 
 ## 📊 Health Diagnostics & Metrics

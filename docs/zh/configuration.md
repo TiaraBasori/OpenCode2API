@@ -15,7 +15,8 @@
 | `OPENCODE_SERVER_PORT` | - | `10001` | 后端端口，仅用于生成默认 `OPENCODE_SERVER_URL` |
 | `OPENCODE_SERVER_URL` | `OPENCODE_SERVER_URL` | `http://127.0.0.1:10001` | OpenCode 后端地址 |
 | `OPENCODE_SERVER_PASSWORD` | `OPENCODE_SERVER_PASSWORD` | (空) | 后端认证密码 |
-| `API_KEY` | `API_KEY` | (空) | 代理的 Bearer 认证密钥，未配置则不鉴权 |
+| `API_KEY` | `API_KEY` | (空) | 代理的 Bearer 认证密钥（管理端点也用它做管理员认证），未配置则不鉴权 |
+| `OPENCODE_API_KEYS` | `API_KEYS` | (空) | 多用户 API key 列表：env 用逗号分隔的 `name:key` 字符串，config.json 用 `[{name, key}]` 数组。详见[多用户 API Keys](#-多用户-api-keys) |
 | `OPENCODE_PROXY_MANAGE_BACKEND` | `MANAGE_BACKEND` | `true` | 由代理拉起并管理 OpenCode 后端进程，后端会加载工具锁插件 |
 | `OPENCODE_PATH` | `OPENCODE_PATH` | `opencode` | OpenCode 可执行文件路径 |
 | `OPENCODE_ZEN_API_KEY` | `ZEN_API_KEY` | (空) | Zen API Key，以 `OPENCODE_API_KEY` 传给代理拉起的后端，用于付费模型 |
@@ -56,6 +57,10 @@
 {
     "PORT": 10000,
     "API_KEY": "your-secret-api-key",
+    "API_KEYS": [
+        { "name": "alice", "key": "sk-alice-..." },
+        { "key": "sk-bare-key-..." }
+    ],
     "BIND_HOST": "0.0.0.0",
     "DISABLE_TOOLS": true,
     "INTERNAL_ALLOWED_TOOLS": ["web_fetch"],
@@ -104,6 +109,115 @@ OpenCode 官方服务会拒绝工具列表被改动的请求（报错 `free tier
     "internal_allowed_tools": ["web_fetch"]
   }
 }
+```
+
+## 👥 多用户 API Keys
+
+除了单一 `API_KEY`，还可以配置一组**具名用户 key**（`API_KEYS`），实现多用户分发与按 key 用量统计。两者可以同时配置：
+
+- 请求命中 `API_KEYS` 中任意一个 key → 认证通过，并记到该 key 名下；
+- 未命中用户 key → 回落到 `API_KEY`（老部署零改动）；
+- 两者都为空 → 不鉴权（现状不变）。
+
+### 配置格式
+
+环境变量 `OPENCODE_API_KEYS` 使用**逗号分隔的 `name:key`** 字符串（env 友好），`=` 也可作分隔符：
+
+```env
+OPENCODE_API_KEYS=alice:sk-alice-xxxx,bob:sk-bob-xxxx,sk-bare-key-xxxx
+```
+
+config.json 顶层使用 `API_KEYS` 数组，每项 `{name, key}`（`name` 可省略）：
+
+```json
+{
+    "API_KEYS": [
+        { "name": "alice", "key": "sk-alice-xxxx" },
+        { "key": "sk-bare-key-xxxx" }
+    ]
+}
+```
+
+**name 语义**：
+
+- 省略 name 的裸 key 自动命名为 `key-N`（N 为该 entry 在列表中的 1-based 位置）；
+- name 是用量统计与 `/admin/keys` 的主键，必须唯一；key 值也必须唯一；
+- 出现重复 name 或重复 key 时**启动直接报错退出**，避免带病运行。
+
+### 认证行为
+
+- 命中用户 key 的请求对业务端点（`/v1/chat/completions`、`/v1/responses` 等）与 `API_KEY` 完全同权；
+- `/health/details`、`/metrics` 的鉴权语义不变（默认要求 Bearer，`OPENCODE_PUBLIC_DIAGNOSTICS=true` 时免认证，用户 key 与 `API_KEY` 均可通过）；
+- 删除（revoke）某个用户 key 后，用该 key 发出的请求立即返回 401。
+
+### 管理端点（/admin/keys）
+
+仅当配置了至少 1 个 `API_KEYS` 条目时才挂载。全部端点要求**管理员认证 = `Bearer API_KEY`**（即老的单一管理密钥，用户 key 一律 401），且不受 `OPENCODE_PUBLIC_DIAGNOSTICS` 影响（无免认证旁路）。`API_KEY` 为空时管理端点返回 `501`（管理面不可用）。
+
+| 方法 | 路径 | 说明 |
+|:-----|:-----|:-----|
+| `GET` | `/admin/keys` | 列出全部用户 key 及其用量 |
+| `POST` | `/admin/keys` | 运行时热加 key，body 为 `{"name": "carol", "key": "sk-..."}`；重名或 key 重复返回 `400` |
+| `DELETE` | `/admin/keys/:name` | 移除 key；不存在返回 `404`，成功返回 `204` |
+
+`GET /admin/keys` 响应示例（keyHint 只露末 4 位，完整 key 不可回取）：
+
+```json
+[
+  {
+    "name": "alice",
+    "keyHint": "…xxxx",
+    "requests": 12,
+    "promptTokens": 8451,
+    "completionTokens": 2210,
+    "totalTokens": 10661,
+    "lastUsedAt": 1789000000000,
+    "createdAt": 1788900000000
+  }
+]
+```
+
+### 用量口径
+
+用量保存在内存中，随进程重启清零（不做持久化）：
+
+- **requests**：认证通过后进入业务 handler 的请求数（`/v1/chat/completions`、`/v1/responses`），失败的请求（4xx/5xx）同样计入；
+- **promptTokens / completionTokens**：仅成功请求累计，沿用 `Math.ceil(字符数 / 4)` 的估算口径，completionTokens 包含 reasoning tokens（与响应 usage 字段一致）；
+- **lastUsedAt / createdAt**：最后一次使用时间与 key 创建（进程启动或运行时新增）时间的毫秒时间戳。
+
+`/health/details` 在多用户模式下额外返回 `usage` 字段（单 key 部署不出现，保持兼容）：
+
+```json
+{
+  "status": "ok",
+  "proxy": true,
+  "usage": {
+    "byKey": {
+      "alice": {
+        "requests": 12,
+        "promptTokens": 8451,
+        "completionTokens": 2210,
+        "totalTokens": 10661,
+        "lastUsedAt": 1789000000000,
+        "createdAt": 1788900000000
+      }
+    },
+    "total": {
+      "requests": 12,
+      "promptTokens": 8451,
+      "completionTokens": 2210,
+      "totalTokens": 10661
+    }
+  }
+}
+```
+
+`/metrics` 在多用户模式下输出按 key 的 Prometheus 计数器：
+
+```text
+opencode_proxy_key_requests_total{key="alice"}
+opencode_proxy_key_tokens_total{key="alice",type="prompt"}
+opencode_proxy_key_tokens_total{key="alice",type="completion"}
 ```
 
 ## 📊 健康诊断与指标
