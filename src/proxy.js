@@ -10,6 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { EXTERNAL_TOOL_PREFIX } from './tool-runtime/contracts.js';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
@@ -574,7 +575,7 @@ export function createApp(config) {
     app.use(cors({
         origin: '*',
         methods: ['GET', 'POST', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization']
+        allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version']
     }));
     app.use(bodyParser.json({ limit: '50mb' }));
     app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
@@ -587,7 +588,16 @@ export function createApp(config) {
         if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
         if (API_KEY && API_KEY.trim() !== '') {
             const authHeader = req.headers.authorization;
-            if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
+            // Anthropic Messages clients authenticate via x-api-key; scope it to
+            // /v1/messages so the OpenAI-compatible endpoints stay Bearer-only.
+            const anthropicApiKeyOk = req.path === '/v1/messages' && req.headers['x-api-key'] === API_KEY;
+            if ((!authHeader || authHeader !== `Bearer ${API_KEY}`) && !anthropicApiKeyOk) {
+                if (req.path === '/v1/messages') {
+                    return res.status(401).json({
+                        type: 'error',
+                        error: { type: 'authentication_error', message: 'invalid x-api-key' }
+                    });
+                }
                 return res.status(401).json({ error: { message: 'Unauthorized' } });
             }
         }
@@ -2421,6 +2431,578 @@ export function createApp(config) {
             console.error('[Proxy] Request Handler Error:', error.message);
             if (!res.headersSent) {
                 res.status(500).json({ error: { message: error.message, type: error.constructor.name } });
+            }
+        }
+    });
+
+    // Anthropic Messages API endpoint
+    app.post('/v1/messages', async (req, res) => {
+        try {
+            await lock(async () => {
+                let sessionId = null;
+                let id = `msg_${crypto.randomUUID()}`;
+                let keepaliveInterval = null;
+                let stream = false;
+                let pID = 'opencode';
+                let mID = 'kimi-k2.5-free';
+
+                const anthropicError = (statusCode, type, message) => res.status(statusCode).json({
+                    type: 'error',
+                    error: { type, message }
+                });
+
+                try {
+                    const body = req.body || {};
+                    const { model, messages, system, stream: requestStream } = body;
+                    stream = Boolean(requestStream);
+
+                    if (!Array.isArray(messages) || messages.length === 0) {
+                        return anthropicError(400, 'invalid_request_error', 'messages: messages must be a non-empty array');
+                    }
+                    if (!Number.isInteger(body.max_tokens) || body.max_tokens <= 0) {
+                        return anthropicError(400, 'invalid_request_error', 'max_tokens: max_tokens is required and must be a positive integer');
+                    }
+                    if (!model || typeof model !== 'string') {
+                        return anthropicError(400, 'invalid_request_error', 'model: model is required');
+                    }
+
+                    // Anthropic tool definitions -> OpenAI function shape
+                    const tools = Array.isArray(body.tools)
+                        ? body.tools.map((tool) => ({
+                            type: 'function',
+                            function: {
+                                name: tool?.name,
+                                description: tool?.description,
+                                parameters: tool?.input_schema
+                            }
+                        })).filter((tool) => tool.function.name)
+                        : [];
+
+                    // Anthropic tool_choice -> OpenAI tool_choice
+                    const rawToolChoice = body.tool_choice;
+                    let toolChoice;
+                    if (rawToolChoice && typeof rawToolChoice === 'object') {
+                        if (rawToolChoice.type === 'auto') toolChoice = 'auto';
+                        else if (rawToolChoice.type === 'any') toolChoice = 'required';
+                        else if (rawToolChoice.type === 'tool' && rawToolChoice.name) {
+                            toolChoice = { type: 'function', function: { name: rawToolChoice.name } };
+                        }
+                    } else if (rawToolChoice === 'auto' || rawToolChoice === 'required' || rawToolChoice === 'none') {
+                        toolChoice = rawToolChoice;
+                    }
+
+                    const requestParams = {
+                        max_tokens: body.max_tokens,
+                        temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
+                        top_p: typeof body.top_p === 'number' ? body.top_p : undefined,
+                        stop: Array.isArray(body.stop_sequences) ? body.stop_sequences : undefined,
+                        reasoning_effort: null
+                    };
+
+                    const resolvedModel = await resolveRequestedModel(model);
+                    pID = resolvedModel.providerID;
+                    mID = resolvedModel.modelID;
+                    if (resolvedModel.aliasFrom) {
+                        logDebug('Resolved model alias', { from: resolvedModel.aliasFrom, to: resolvedModel.resolved });
+                    }
+
+                    const buildAnthropicPromptParts = async (rawMessages, systemParam, externalToolRegistry = []) => {
+                        const parts = [];
+                        const systemChunks = [];
+                        const userContents = [];
+                        const assistantToolCalls = new Map();
+                        const formatRoleLine = (role, text) => `${role.toUpperCase()}: ${text}`;
+
+                        if (typeof systemParam === 'string' && systemParam.trim()) {
+                            systemChunks.push(systemParam);
+                        } else if (Array.isArray(systemParam)) {
+                            const text = systemParam
+                                .map((block) => (block && typeof block.text === 'string') ? block.text : '')
+                                .filter(Boolean)
+                                .join('\n\n');
+                            if (text) systemChunks.push(text);
+                        }
+
+                        const pushImagePart = async (source) => {
+                            let imageUrl = null;
+                            let fallbackMime = 'image/jpeg';
+                            if (source?.type === 'url' && typeof source.url === 'string') {
+                                imageUrl = source.url;
+                            } else if (source?.type === 'base64' && typeof source.data === 'string') {
+                                fallbackMime = source.media_type || fallbackMime;
+                                imageUrl = `data:${source.media_type || 'image/jpeg'};base64,${source.data}`;
+                            }
+                            if (!imageUrl) return;
+                            try {
+                                const dataUri = await getImageDataUri(imageUrl);
+                                const mime = dataUri.split(';')[0].split(':')[1] || fallbackMime;
+                                parts.push({ type: 'file', mime, url: dataUri, filename: 'image' });
+                            } catch (imgErr) {
+                                console.warn('[Proxy] Skipping image due to error:', imgErr.message);
+                            }
+                        };
+
+                        for (const m of rawMessages) {
+                            const role = m?.role === 'assistant' ? 'assistant' : 'user';
+                            const content = m?.content;
+                            const blocks = Array.isArray(content)
+                                ? content
+                                : (content !== undefined && content !== null && content !== '' ? [{ type: 'text', text: String(content) }] : []);
+
+                            if (role === 'assistant' && Array.isArray(m?.tool_calls) && m.tool_calls.length) {
+                                const serializedToolCalls = m.tool_calls.map((toolCall, index) => ({
+                                    id: toolCall?.id || `call_${index + 1}`,
+                                    name: findExternalToolByName(externalToolRegistry, toolCall?.function?.name || toolCall?.name)?.namespacedName || toolCall?.function?.name || toolCall?.name,
+                                    arguments: normalizeToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments)
+                                })).filter((toolCall) => toolCall.name);
+                                if (serializedToolCalls.length) {
+                                    serializedToolCalls.forEach((toolCall) => assistantToolCalls.set(toolCall.id, toolCall.name));
+                                    parts.push({
+                                        type: 'text',
+                                        text: `ASSISTANT: <function_calls>${JSON.stringify(serializedToolCalls)}</function_calls>`
+                                    });
+                                }
+                            }
+
+                            for (const block of blocks) {
+                                if (!block) continue;
+
+                                if (role === 'assistant' && block.type === 'tool_use') {
+                                    const name = findExternalToolByName(externalToolRegistry, block?.name)?.namespacedName || block?.name;
+                                    if (!name) continue;
+                                    if (block?.id) assistantToolCalls.set(block.id, name);
+                                    parts.push({
+                                        type: 'text',
+                                        text: `ASSISTANT: <function_calls>${JSON.stringify([{
+                                            id: block?.id || `call_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`,
+                                            name,
+                                            arguments: normalizeToolArguments(block?.input)
+                                        }])}</function_calls>`
+                                    });
+                                    continue;
+                                }
+
+                                if (role === 'user' && block.type === 'tool_result') {
+                                    const text = normalizeToolResultContent(block?.content);
+                                    if (!text) continue;
+                                    const mappedTool = findExternalToolByName(externalToolRegistry, block?.name)
+                                        || findExternalToolByName(externalToolRegistry, assistantToolCalls.get(block?.tool_use_id));
+                                    const toolName = mappedTool?.namespacedName || assistantToolCalls.get(block?.tool_use_id) || `${EXTERNAL_TOOL_PREFIX}unknown`;
+                                    const toolCallId = block?.tool_use_id || `call_${toolName.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+                                    parts.push({
+                                        type: 'text',
+                                        text: `TOOL_RESULT: ${JSON.stringify({ tool_call_id: toolCallId, name: toolName, content: text })}`
+                                    });
+                                    continue;
+                                }
+
+                                if (block.type === 'image') {
+                                    await pushImagePart(block?.source);
+                                    continue;
+                                }
+
+                                if (block.type === 'text' && block.text) {
+                                    if (role === 'user') userContents.push(block.text);
+                                    parts.push({ type: 'text', text: formatRoleLine(role, block.text) });
+                                }
+                            }
+                        }
+
+                        return {
+                            parts,
+                            system: systemChunks.join('\n\n'),
+                            fullPromptText: parts.map(p => p.text).join('\n\n'),
+                            lastUserMsg: userContents[userContents.length - 1] || ''
+                        };
+                    };
+
+                    const requestToolContext = createRequestToolContext(tools, toolChoice, body.opencode);
+                    const toolMode = requestToolContext.mode;
+                    const externalToolContext = requestToolContext.external;
+                    const externalToolRegistry = externalToolContext.registry;
+                    const externalToolChoice = externalToolContext.toolChoice;
+                    const internalToolContext = requestToolContext.internal;
+                    trackToolMode(toolMode, {
+                        configuredAllowlist: internalToolContext.allowedToolNames,
+                        requestedAllowlist: internalToolContext.requestedAllowlist,
+                        deniedRequestedTools: internalToolContext.deniedRequestedTools,
+                        resolutionPath: internalToolContext.resolutionPath,
+                        resultingMode: internalToolContext.resultingMode,
+                        route: '/v1/messages'
+                    });
+
+                    const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildAnthropicPromptParts(messages, system, externalToolRegistry);
+                    const systemWithGuard = buildSystemPrompt(
+                        [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
+                        requestParams.reasoning_effort,
+                        toolMode,
+                        internalToolContext.allowedToolNames
+                    );
+                    if (!parts.length) {
+                        return anthropicError(400, 'invalid_request_error', 'messages: messages must include at least one text, image or tool block');
+                    }
+                    logDebug('Anthropic request start', {
+                        model: `${pID}/${mID}`,
+                        stream,
+                        userMessages: messages.length,
+                        system: Boolean(systemMsg),
+                        parts: parts.length,
+                        toolMode
+                    });
+
+                    await ensureBackend(config);
+                    try {
+                        await client.config.update({
+                            body: { activeModel: { providerID: pID, modelID: mID } }
+                        });
+                    } catch (confError) {
+                        logDebug('Failed to set active model:', confError.message);
+                    }
+
+                    const toolControl = await resolveToolControl(toolMode, internalToolContext);
+                    sessionId = await createSession(toolControl);
+                    logDebug('Session created', { sessionId });
+
+                    const promptParams = {
+                        path: { id: sessionId },
+                        body: {
+                            model: { providerID: pID, modelID: mID },
+                            system: systemWithGuard,
+                            parts: externalToolContext.reminder
+                                ? [...parts, { type: 'text', text: externalToolContext.reminder }]
+                                : parts,
+                            ...(requestParams.max_tokens && { max_tokens: requestParams.max_tokens }),
+                            ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
+                            ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
+                            ...(requestParams.stop && { stop: requestParams.stop })
+                        }
+                    };
+                    const { toolOverrides } = toolControl;
+                    if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                        promptParams.body.tools = toolOverrides;
+                    }
+
+                    res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
+                    res.setHeader('Cache-Control', 'no-cache');
+                    res.setHeader('Connection', 'keep-alive');
+
+                    const anthropicStopReason = (toolUseCount) => (toolUseCount > 0 ? 'tool_use' : 'end_turn');
+
+                    if (stream) {
+                        const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
+                        const filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
+                        const filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
+                        const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                        const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                        let streamedContent = '';
+                        let streamedReasoning = '';
+                        let rawStreamedContent = '';
+                        let rawStreamedReasoning = '';
+                        const streamedToolCalls = [];
+                        let completionTokens = 0;
+                        let reasoningTokens = 0;
+
+                        keepaliveInterval = setInterval(() => {
+                            if (!res.destroyed) {
+                                res.write(': keepalive\n\n');
+                            }
+                        }, 15000);
+
+                        const sendDelta = (delta, isReasoning = false) => {
+                            if (!delta) return;
+                            if (isReasoning) rawStreamedReasoning += delta;
+                            else rawStreamedContent += delta;
+                            const parsedDeltaToolCalls = isReasoning
+                                ? parseReasoningToolCalls(delta)
+                                : parseContentToolCalls(delta);
+                            parsedDeltaToolCalls.forEach((toolCall) => streamedToolCalls.push(toolCall));
+                            const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                            if (!filtered) return;
+                            if (isReasoning) {
+                                streamedReasoning += filtered;
+                                reasoningTokens += Math.ceil(filtered.length / 4);
+                            } else {
+                                streamedContent += filtered;
+                                completionTokens += Math.ceil(filtered.length / 4);
+                            }
+                        };
+
+                        let collected = null;
+                        for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+                            if (attempt > 1) {
+                                // Retry on a fresh session (same rationale as chat completions).
+                                try {
+                                    await client.session.delete({ path: { id: sessionId } });
+                                } catch (e) {
+                                    logDebug('Failed to delete retried session', { sessionId, error: e.message });
+                                }
+                                sessionId = await createSession(toolControl);
+                                promptParams.path.id = sessionId;
+                                streamedContent = '';
+                                streamedReasoning = '';
+                                rawStreamedContent = '';
+                                rawStreamedReasoning = '';
+                                streamedToolCalls.length = 0;
+                                completionTokens = 0;
+                                reasoningTokens = 0;
+                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                            }
+                            try {
+                                const collectPromise = collectFromEvents(
+                                    sessionId,
+                                    REQUEST_TIMEOUT_MS,
+                                    sendDelta,
+                                    EVENT_FIRST_DELTA_TIMEOUT_MS,
+                                    EVENT_IDLE_TIMEOUT_MS
+                                );
+                                const safeCollect = collectPromise.catch((err) => ({ __error: err }));
+                                client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
+                                collected = await safeCollect;
+                            } catch (e) {
+                                logDebug('Anthropic stream error:', e.message);
+                            }
+
+                            const attemptError = collected?.error || collected?.__error || null;
+                            const nothingStreamed = !rawStreamedContent
+                                && !rawStreamedReasoning
+                                && streamedToolCalls.length === 0;
+                            if (
+                                attemptError
+                                && nothingStreamed
+                                && attempt < RETRY_MAX_ATTEMPTS
+                                && isTransientUpstreamError(attemptError)
+                            ) {
+                                console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, attemptError.data?.message || attemptError.message || attemptError.name || 'unknown');
+                                continue;
+                            }
+                            break;
+                        }
+
+                        const pollFallback = async () => {
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (error && !content && !reasoning) {
+                                logDebug('Anthropic stream fallback error', { error: error.message });
+                                return;
+                            }
+                            if (reasoning) sendDelta(reasoning, true);
+                            if (content) sendDelta(content, false);
+                        };
+                        if (collected && (collected.__error || collected.noData || collected.idleTimeout)) {
+                            logDebug('Anthropic SSE fallback to polling', { sessionId });
+                            await pollFallback();
+                        }
+                        if (!streamedContent && !streamedReasoning && streamedToolCalls.length === 0) {
+                            logDebug('Anthropic SSE returned empty, falling back to polling', { sessionId });
+                            await pollFallback();
+                        }
+
+                        const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
+                        const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
+                        const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
+                        const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
+                        const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
+                        const finalContentText = rawStreamedContent + flushedContentText;
+
+                        let parsedToolCalls = streamedToolCalls.length > 0
+                            ? streamedToolCalls
+                            : [
+                                ...flushedReasoningCalls,
+                                ...flushedContentCalls,
+                                ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
+                            ];
+                        if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0) {
+                            parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
+                        }
+
+                        const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+
+                        if (keepaliveInterval) clearInterval(keepaliveInterval);
+                        keepaliveInterval = null;
+
+                        const promptTokens = Math.ceil((fullPromptText || '').length / 4);
+                        const outputTokens = completionTokens + reasoningTokens;
+                        const writeEvent = (event) => {
+                            res.write(`data: ${JSON.stringify(event)}\n\n`);
+                        };
+
+                        writeEvent({
+                            type: 'message_start',
+                            message: {
+                                id,
+                                type: 'message',
+                                role: 'assistant',
+                                model: `${pID}/${mID}`,
+                                content: [],
+                                stop_sequence: null,
+                                stop_reason: null,
+                                usage: { input_tokens: promptTokens, output_tokens: 0 }
+                            }
+                        });
+
+                        let blockIndex = 0;
+                        if (streamedReasoning) {
+                            writeEvent({ type: 'content_block_start', index: blockIndex, content_block: { type: 'thinking', thinking: '' } });
+                            writeEvent({ type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: streamedReasoning } });
+                            writeEvent({ type: 'content_block_stop', index: blockIndex });
+                            blockIndex += 1;
+                        }
+                        if (streamedContent) {
+                            writeEvent({ type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
+                            writeEvent({ type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: streamedContent } });
+                            writeEvent({ type: 'content_block_stop', index: blockIndex });
+                            blockIndex += 1;
+                        }
+                        validatedToolCalls.forEach((call) => {
+                            let input = {};
+                            try {
+                                input = JSON.parse(call.function.arguments);
+                            } catch (e) {
+                                input = {};
+                            }
+                            writeEvent({
+                                type: 'content_block_start',
+                                index: blockIndex,
+                                content_block: {
+                                    type: 'tool_use',
+                                    id: call.id,
+                                    name: call.tool?.originalName || call.function.name,
+                                    input: {}
+                                }
+                            });
+                            writeEvent({
+                                type: 'content_block_delta',
+                                index: blockIndex,
+                                delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) }
+                            });
+                            writeEvent({ type: 'content_block_stop', index: blockIndex });
+                            blockIndex += 1;
+                        });
+
+                        writeEvent({
+                            type: 'message_delta',
+                            delta: { stop_reason: anthropicStopReason(validatedToolCalls.length), stop_sequence: null },
+                            usage: { output_tokens: outputTokens }
+                        });
+                        writeEvent({ type: 'message_stop' });
+                        res.end();
+                    } else {
+                        let content = '';
+                        let reasoning = '';
+                        let error = null;
+                        for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+                            if (attempt > 1) {
+                                // Retry on a fresh session (same rationale as chat completions).
+                                try {
+                                    await client.session.delete({ path: { id: sessionId } });
+                                } catch (e) {
+                                    logDebug('Failed to delete retried session', { sessionId, error: e.message });
+                                }
+                                sessionId = await createSession(toolControl);
+                                promptParams.path.id = sessionId;
+                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                            }
+                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            content = collected.content || '';
+                            reasoning = collected.reasoning || '';
+                            error = collected.error || null;
+                            if (
+                                error
+                                && !content
+                                && !reasoning
+                                && attempt < RETRY_MAX_ATTEMPTS
+                                && isTransientUpstreamError(error)
+                            ) {
+                                console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, error.data?.message || error.message || error.name || 'unknown');
+                                continue;
+                            }
+                            break;
+                        }
+                        if (error && !content && !reasoning) {
+                            return anthropicError(502, error.name || 'api_error', error.data?.message || error.message || 'OpenCode provider error');
+                        }
+                        const parsedToolCalls = externalToolRegistry.length > 0
+                            ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                            : [];
+                        const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
+                        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
+
+                        const anthropicContent = [];
+                        if (safeReasoning) anthropicContent.push({ type: 'thinking', thinking: safeReasoning });
+                        if (safeContent) anthropicContent.push({ type: 'text', text: safeContent });
+                        validatedToolCalls.forEach((call) => {
+                            let input = {};
+                            try {
+                                input = JSON.parse(call.function.arguments);
+                            } catch (e) {
+                                input = {};
+                            }
+                            anthropicContent.push({
+                                type: 'tool_use',
+                                id: call.id,
+                                name: call.tool?.originalName || call.function.name,
+                                input
+                            });
+                        });
+
+                        const promptTokens = Math.ceil((fullPromptText || '').length / 4);
+                        const completionTokensCalc = Math.ceil((content || '').length / 4);
+                        const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
+
+                        res.json({
+                            id,
+                            type: 'message',
+                            role: 'assistant',
+                            model: `${pID}/${mID}`,
+                            content: anthropicContent,
+                            stop_reason: anthropicStopReason(validatedToolCalls.length),
+                            stop_sequence: null,
+                            usage: {
+                                input_tokens: promptTokens,
+                                output_tokens: completionTokensCalc + reasoningTokensCalc
+                            }
+                        });
+                    }
+                } catch (error) {
+                    console.error('[Proxy] Anthropic API Error:', error.message);
+                    if (keepaliveInterval) clearInterval(keepaliveInterval);
+
+                    if (error.code === 'model_not_found') {
+                        if (!res.headersSent) {
+                            return anthropicError(400, 'model_not_found', error.message || `Model not found: ${model}`);
+                        }
+                    }
+                    if (!res.headersSent) {
+                        const transformed = transformUpstreamError(error);
+                        return res.status(transformed.statusCode).json({
+                            type: 'error',
+                            error: {
+                                type: transformed.error.code || transformed.error.type || 'api_error',
+                                message: transformed.error.message
+                            }
+                        });
+                    }
+                    if (!res.destroyed) {
+                        res.write(`data: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: error.message } })}\n\n`);
+                        res.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+                        res.end();
+                    }
+                    if (sessionId) {
+                        try {
+                            await client.session.delete({ path: { id: sessionId } });
+                        } catch (e) {
+                            console.error('[Proxy] Failed to cleanup session on error:', e.message);
+                        }
+                    }
+                } finally {
+                    if (typeof keepaliveInterval !== 'undefined' && keepaliveInterval) clearInterval(keepaliveInterval);
+                }
+            }, REQUEST_TIMEOUT_MS + 20000);
+        } catch (error) {
+            console.error('[Proxy] Anthropic Request Handler Error:', error.message);
+            if (!res.headersSent) {
+                res.status(500).json({ type: 'error', error: { type: 'api_error', message: error.message } });
             }
         }
     });

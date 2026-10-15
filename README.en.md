@@ -103,6 +103,49 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
 
 When the model calls tools, non-streaming responses return `message.tool_calls` and streaming responses return `delta.tool_calls`.
 
+### Anthropic Messages API (/v1/messages)
+
+An endpoint for Claude SDK / Anthropic clients. Authentication uses the `x-api-key` header (`Authorization: Bearer` also works), and tool calls come back as `tool_use` content blocks.
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "x-api-key: ***" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "max_tokens": 1024,
+    "system": "You are concise.",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+Tool round-trip (send results back as `tool_result` blocks):
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "x-api-key: ***" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Fetch the title of https://example.com"}],
+    "tools": [{
+      "name": "web_fetch",
+      "description": "Fetch a URL and return its content summary",
+      "input_schema": {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"]
+      }
+    }]
+  }'
+```
+
+The response contains a `{"type":"tool_use","id":"…","name":"web_fetch","input":{…}}` content block (`stop_reason: "tool_use"`); send the result back as a `{"type":"tool_result","tool_use_id":"…","content":"…"}` user block to continue the conversation. With `stream: true` the proxy emits the Anthropic SSE sequence `message_start` → `content_block_*` → `message_delta` → `message_stop`.
+
 ## ⚙️ Configuration
 
 | Environment variable | Default | Description |
@@ -142,6 +185,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/v1/models` | Model list |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
+| `POST` | `/v1/messages` | Anthropic Messages API (Claude SDK compatible) |
 
 Model names: `opencode/big-pickle`, `gpt5-nano` (auto-resolved to `gpt-5-nano`), `opencode/gpt5-nano`.
 

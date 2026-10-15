@@ -103,6 +103,49 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
 
 模型决定调用工具时，非流式响应返回 `message.tool_calls`，流式响应返回 `delta.tool_calls`。
 
+### Anthropic Messages API（/v1/messages）
+
+面向 Claude SDK / Anthropic 客户端的端点。认证使用 `x-api-key` header（`Authorization: Bearer` 亦可用），模型决定调用工具时返回 `tool_use` 内容块。
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "x-api-key: ***" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "max_tokens": 1024,
+    "system": "You are concise.",
+    "messages": [{"role": "user", "content": "你好!"}],
+    "stream": true
+  }'
+```
+
+工具往返（工具结果以 `tool_result` 块回传）：
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "x-api-key: ***" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "帮我获取 https://example.com 的标题"}],
+    "tools": [{
+      "name": "web_fetch",
+      "description": "Fetch a URL and return its content summary",
+      "input_schema": {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"]
+      }
+    }]
+  }'
+```
+
+响应包含 `{"type":"tool_use","id":"…","name":"web_fetch","input":{…}}` 内容块（`stop_reason: "tool_use"`）；把工具结果作为 `{"type":"tool_result","tool_use_id":"…","content":"…"}` 用户块发回即可继续对话。`stream: true` 时按 Anthropic SSE 事件序输出 `message_start` → `content_block_*` → `message_delta` → `message_stop`。
+
 ## ⚙️ 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -142,6 +185,7 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/v1/models` | 模型列表 |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
+| `POST` | `/v1/messages` | Anthropic Messages API（兼容 Claude SDK） |
 
 模型名称写法：`opencode/big-pickle`、`gpt5-nano`（自动解析为 `gpt-5-nano`）、`opencode/gpt5-nano`。
 

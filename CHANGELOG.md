@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Anthropic Messages API**: `POST /v1/messages` implements the Anthropic Messages protocol (Claude SDK compatible) on top of the same OpenCode backend — `x-api-key` or Bearer auth, `system` (string or blocks), text/image/tool_use/tool_result content blocks, `tools` with `input_schema`, `tool_choice`, `stop_sequences`, and Anthropic-shaped errors (`{type:'error',error:{type,message}}`). Tool calls surface as `tool_use` content blocks with the original client tool names (no `external__` namespace). Streaming (`stream: true`) emits the Anthropic SSE sequence — `message_start`, `content_block_start/delta/stop` (`thinking_delta`, `text_delta`, `input_json_delta`), `message_delta`, `message_stop` — with keepalives and polling fallback, mirroring the chat-completions pipeline including transient-error retry. Documented in both READMEs; covered by `tests/unit/anthropic.test.js`.
+
 ## [2.5.0] - 2026-10-15
 
 ### Fixed
