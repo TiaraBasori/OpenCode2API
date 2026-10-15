@@ -224,6 +224,25 @@ function normalizeApiKeyName(name, fallback) {
     return cleaned || fallback;
 }
 
+// Names must survive the admin REST surface: DELETE /admin/keys/:name routes on
+// the raw name, so path separators can never be addressed, and `%` breaks
+// param decoding for clients that forget to encode. Length is capped to keep
+// admin tables and metrics sane; `__api_key__` is reserved for the legacy
+// master-key pseudo-entry. Throws with a clear message on violation.
+const API_KEY_NAME_MAX_LENGTH = 64;
+
+function validateApiKeyName(name) {
+    if (name === MASTER_KEY_NAME) {
+        throw new Error(`[Config] API_KEYS name "${MASTER_KEY_NAME}" is reserved`);
+    }
+    if (name.length > API_KEY_NAME_MAX_LENGTH) {
+        throw new Error(`[Config] API_KEYS name "${name.slice(0, 24)}…" exceeds ${API_KEY_NAME_MAX_LENGTH} characters`);
+    }
+    if (/[/%?#\\]/.test(name)) {
+        throw new Error(`[Config] API_KEYS name "${name}" must not contain "/", "\\", "%" or URL-significant characters`);
+    }
+}
+
 /**
  * Parse the optional multi-user API_KEYS configuration.
  *
@@ -282,6 +301,7 @@ export function parseApiKeysConfig(value) {
             throw new Error(`[Config] API_KEYS entry #${index + 1} is missing a key`);
         }
         name = normalizeApiKeyName(name, `${DEFAULT_KEY_NAME_PREFIX}-${index + 1}`);
+        validateApiKeyName(name);
         if (seenKeys.has(key)) {
             throw new Error(`[Config] API_KEYS contains a duplicate key for "${name}"; every key value must be unique`);
         }
@@ -2708,16 +2728,26 @@ export function createApp(config) {
         }
     });
 
-    const hasValidBearerAuth = (req) => {
-        if (!API_KEY || API_KEY.trim() === '') return true;
-        const authHeader = req.headers.authorization;
-        return Boolean(authHeader && authHeader === `Bearer ${API_KEY}`);
+    const resolveDiagnosticsCaller = (req) => {
+        if (!adminAuthEnabled && !multiUserEnabled) {
+            return { allowed: true, role: 'admin', keyName: null };
+        }
+        const token = extractBearerToken(req);
+        if (adminAuthEnabled && token && safeTokenEquals(token, API_KEY.trim())) {
+            return { allowed: true, role: 'admin', keyName: MASTER_KEY_NAME };
+        }
+        if (multiUserEnabled && token && apiKeyToName.has(token)) {
+            return { allowed: true, role: 'user', keyName: apiKeyToName.get(token) };
+        }
+        if (PUBLIC_DIAGNOSTICS) {
+            return { allowed: true, role: 'public', keyName: null };
+        }
+        return { allowed: false, role: 'none', keyName: null };
     };
 
     const shouldAllowOperationalEndpoint = (req, { enabled }) => {
         if (!enabled) return false;
-        if (PUBLIC_DIAGNOSTICS) return true;
-        return hasValidBearerAuth(req);
+        return resolveDiagnosticsCaller(req).allowed;
     };
 
     // Per-key usage snapshot shared by /admin/keys and /health/details.
@@ -2778,6 +2808,11 @@ export function createApp(config) {
             const cleanName = normalizeApiKeyName(name, '');
             if (!cleanName) {
                 return res.status(400).json({ error: { message: 'Invalid key name' } });
+            }
+            try {
+                validateApiKeyName(cleanName);
+            } catch (err) {
+                return res.status(400).json({ error: { message: err.message } });
             }
             if (apiKeyByName.has(cleanName)) {
                 return res.status(400).json({ error: { message: `Key name "${cleanName}" already exists` } });
@@ -2847,11 +2882,17 @@ export function createApp(config) {
             }
         };
         // Per-key usage only appears in multi-user mode so single-key
-        // deployments keep their exact legacy snapshot shape.
+        // deployments keep their exact legacy snapshot shape. Admin callers see
+        // every key; a user key only sees its own row; unauthenticated
+        // PUBLIC_DIAGNOSTICS callers see the aggregate total without key names.
         if (multiUserEnabled) {
+            const caller = resolveDiagnosticsCaller(req);
             const { rows, total } = buildUsageRows();
+            const visibleRows = caller.role === 'admin'
+                ? rows
+                : (caller.role === 'user' ? rows.filter((row) => row.name === caller.keyName) : []);
             const byKey = {};
-            rows.forEach((row) => {
+            visibleRows.forEach((row) => {
                 byKey[row.name] = {
                     requests: row.requests,
                     promptTokens: row.promptTokens,
@@ -2889,23 +2930,32 @@ export function createApp(config) {
         ];
 
         // Per-key usage counters, only when multi-user keys are configured.
+        // Scoped the same way as /health/details: admin sees all keys, a user
+        // key sees only its own counter, and unauthenticated PUBLIC_DIAGNOSTICS
+        // scrapes omit per-key labels so key names are never leaked publicly.
         if (multiUserEnabled) {
+            const caller = resolveDiagnosticsCaller(req);
             const { rows } = buildUsageRows();
-            metricsLines.push(
-                '# HELP opencode_proxy_key_requests_total Count of requests authenticated with each named API key.',
-                '# TYPE opencode_proxy_key_requests_total counter'
-            );
-            rows.forEach((row) => {
-                metricsLines.push(`opencode_proxy_key_requests_total{key="${escapePrometheusLabel(row.name)}"} ${row.requests}`);
-            });
-            metricsLines.push(
-                '# HELP opencode_proxy_key_tokens_total Tokens billed per named API key and type (prompt/completion, reasoning included in completion).',
-                '# TYPE opencode_proxy_key_tokens_total counter'
-            );
-            rows.forEach((row) => {
-                metricsLines.push(`opencode_proxy_key_tokens_total{key="${escapePrometheusLabel(row.name)}",type="prompt"} ${row.promptTokens}`);
-                metricsLines.push(`opencode_proxy_key_tokens_total{key="${escapePrometheusLabel(row.name)}",type="completion"} ${row.completionTokens}`);
-            });
+            const visibleRows = caller.role === 'admin'
+                ? rows
+                : (caller.role === 'user' ? rows.filter((row) => row.name === caller.keyName) : []);
+            if (visibleRows.length > 0) {
+                metricsLines.push(
+                    '# HELP opencode_proxy_key_requests_total Count of requests authenticated with each named API key.',
+                    '# TYPE opencode_proxy_key_requests_total counter'
+                );
+                visibleRows.forEach((row) => {
+                    metricsLines.push(`opencode_proxy_key_requests_total{key="${escapePrometheusLabel(row.name)}"} ${row.requests}`);
+                });
+                metricsLines.push(
+                    '# HELP opencode_proxy_key_tokens_total Tokens billed per named API key and type (prompt/completion, reasoning included in completion).',
+                    '# TYPE opencode_proxy_key_tokens_total counter'
+                );
+                visibleRows.forEach((row) => {
+                    metricsLines.push(`opencode_proxy_key_tokens_total{key="${escapePrometheusLabel(row.name)}",type="prompt"} ${row.promptTokens}`);
+                    metricsLines.push(`opencode_proxy_key_tokens_total{key="${escapePrometheusLabel(row.name)}",type="completion"} ${row.completionTokens}`);
+                });
+            }
         }
 
         res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');

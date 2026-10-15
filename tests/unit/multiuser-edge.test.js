@@ -151,4 +151,59 @@ describe('multiuser edge review', () => {
         expect(alice.promptTokens).toBe(0);
         expect(alice.completionTokens).toBe(0);
     });
+
+    test('rejects unsafe or reserved key names at config parse and hot-add', async () => {
+        const { app } = createApp(baseConfig());
+        for (const badName of ['__api_key__', 'team/alice', 'bad%name', 'a?b', 'a#b', 'x'.repeat(65)]) {
+            const res = await request(app).post('/admin/keys')
+                .set('Authorization', 'Bearer admin-master')
+                .send({ name: badName, key: 'sk-valid-key-9999' });
+            expect(res.status).toBe(400);
+        }
+    });
+
+    test('diagnostics scope per-key usage by caller role (admin vs user vs public)', async () => {
+        const cfg = { ...baseConfig(), METRICS_ENABLED: true, PUBLIC_DIAGNOSTICS: true };
+        const aliceKey = cfg.API_KEYS[0].key;
+        const { app } = createApp(cfg);
+        okSession();
+        await request(app).post('/v1/chat/completions')
+            .set('Authorization', `Bearer ${aliceKey}`)
+            .send({ model: 'opencode/m', messages: [{ role: 'user', content: 'hi' }] });
+
+        // User key sees only its own entry in /health/details and /metrics
+        const userDetails = await request(app).get('/health/details')
+            .set('Authorization', `Bearer ${aliceKey}`);
+        expect(userDetails.status).toBe(200);
+        expect(Object.keys(userDetails.body.usage.byKey)).toEqual(['alice']);
+
+        const userMetrics = await request(app).get('/metrics')
+            .set('Authorization', `Bearer ${aliceKey}`);
+        expect(userMetrics.status).toBe(200);
+        expect(userMetrics.text).toContain('key="alice"');
+        expect(userMetrics.text).not.toContain('key="bob"');
+
+        // Unauthenticated PUBLIC_DIAGNOSTICS caller sees aggregate total but no key names
+        const pubDetails = await request(app).get('/health/details');
+        expect(pubDetails.status).toBe(200);
+        expect(pubDetails.body.usage.byKey).toEqual({});
+        expect(pubDetails.body.usage.total.requests).toBe(1);
+
+        const pubMetrics = await request(app).get('/metrics');
+        expect(pubMetrics.status).toBe(200);
+        expect(pubMetrics.text).not.toContain('key="alice"');
+        expect(pubMetrics.text).not.toContain('key="bob"');
+    });
+
+    test('multi-user mode with empty API_KEY still requires auth on diagnostics when PUBLIC_DIAGNOSTICS is false', async () => {
+        const cfg = { ...baseConfig(), API_KEY: '', METRICS_ENABLED: true, PUBLIC_DIAGNOSTICS: false };
+        const aliceKey = cfg.API_KEYS[0].key;
+        const { app } = createApp(cfg);
+        const unauthDetails = await request(app).get('/health/details');
+        expect(unauthDetails.status).toBe(401);
+        const userDetails = await request(app).get('/health/details')
+            .set('Authorization', `Bearer ${aliceKey}`);
+        expect(userDetails.status).toBe(200);
+        expect(Object.keys(userDetails.body.usage.byKey)).toEqual(['alice']);
+    });
 });

@@ -147,7 +147,7 @@ config.json 顶层使用 `API_KEYS` 数组，每项 `{name, key}`（`name` 可�
 ### 认证行为
 
 - 命中用户 key 的请求对业务端点（`/v1/chat/completions`、`/v1/responses` 等）与 `API_KEY` 完全同权；
-- `/health/details`、`/metrics` 的鉴权语义不变（默认要求 Bearer，`OPENCODE_PUBLIC_DIAGNOSTICS=true` 时免认证，用户 key 与 `API_KEY` 均可通过）；
+- `/health/details`、`/metrics` 的鉴权语义不变（默认要求 Bearer，`OPENCODE_PUBLIC_DIAGNOSTICS=true` 时免认证，用户 key 与 `API_KEY` 均可通过）。多用户模式下，管理员 `API_KEY` 可见全部 key 的 `usage.byKey` 与按 key 指标，普通用户 key 仅可见自身条目，未携带密钥的 `OPENCODE_PUBLIC_DIAGNOSTICS=true` 请求仅返回汇总 `usage.total`（不公开任何 key 名称）；
 - 删除（revoke）某个用户 key 后，用该 key 发出的请求立即返回 401。
 
 ### 管理端点（/admin/keys）

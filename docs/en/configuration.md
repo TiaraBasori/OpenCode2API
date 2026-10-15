@@ -147,7 +147,7 @@ config.json uses an `API_KEYS` array of `{name, key}` entries (`name` optional):
 ### Authentication behavior
 
 - User keys carry exactly the same business-endpoint access (`/v1/chat/completions`, `/v1/responses`, ...) as `API_KEY`;
-- `/health/details` and `/metrics` auth semantics are unchanged (Bearer by default, public with `OPENCODE_PUBLIC_DIAGNOSTICS=true`; user keys and `API_KEY` both pass);
+- `/health/details` and `/metrics` auth semantics are unchanged (Bearer by default, public with `OPENCODE_PUBLIC_DIAGNOSTICS=true`; user keys and `API_KEY` both pass). In multi-user mode, the admin `API_KEY` sees all keys in `usage.byKey` / per-key metrics, a user key sees only its own entry, and unauthenticated `OPENCODE_PUBLIC_DIAGNOSTICS=true` requests see only the aggregate `usage.total` (no key names are exposed publicly);
 - Deleting (revoking) a user key makes that key's requests fail with 401 immediately.
 
 ### Admin endpoints (/admin/keys)
