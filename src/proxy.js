@@ -2778,22 +2778,40 @@ export function createApp(config) {
                             break;
                         }
 
-                        const pollFallback = async () => {
+                        const pollFallback = async (mode) => {
                             const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                             if (error && !content && !reasoning) {
                                 logDebug('Anthropic stream fallback error', { error: error.message });
                                 return;
                             }
+                            if (mode === 'idleTimeout') {
+                                // Same guard as chat completions: the SSE pipe may have
+                                // delivered a prefix before going idle, so only the
+                                // remainder is sent to avoid duplicating text.
+                                const remainingReasoning = reasoning && reasoning.startsWith(rawStreamedReasoning)
+                                    ? reasoning.slice(rawStreamedReasoning.length)
+                                    : reasoning;
+                                const remainingContent = content && content.startsWith(rawStreamedContent)
+                                    ? content.slice(rawStreamedContent.length)
+                                    : content;
+                                if (remainingReasoning) sendDelta(remainingReasoning, true);
+                                if (remainingContent) sendDelta(remainingContent, false);
+                                return;
+                            }
                             if (reasoning) sendDelta(reasoning, true);
                             if (content) sendDelta(content, false);
                         };
-                        if (collected && (collected.__error || collected.noData || collected.idleTimeout)) {
+                        if (collected && (collected.__error || collected.noData)) {
                             logDebug('Anthropic SSE fallback to polling', { sessionId });
-                            await pollFallback();
+                            await pollFallback('full');
+                        }
+                        if (collected && collected.idleTimeout && (streamedContent || streamedReasoning || streamedToolCalls.length > 0)) {
+                            logDebug('Anthropic SSE idle timeout, polling for remainder', { sessionId });
+                            await pollFallback('idleTimeout');
                         }
                         if (!streamedContent && !streamedReasoning && streamedToolCalls.length === 0) {
                             logDebug('Anthropic SSE returned empty, falling back to polling', { sessionId });
-                            await pollFallback();
+                            await pollFallback('full');
                         }
 
                         const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
@@ -2824,6 +2842,23 @@ export function createApp(config) {
                         const writeEvent = (event) => {
                             res.write(`data: ${JSON.stringify(event)}\n\n`);
                         };
+
+                        // Upstream failed on every attempt and fallbacks recovered
+                        // nothing: surface an Anthropic error event instead of an
+                        // empty 200 message (clients cannot tell that apart).
+                        const terminalError = collected?.error || collected?.__error || null;
+                        if (!streamedContent && !streamedReasoning && streamedToolCalls.length === 0 && terminalError) {
+                            writeEvent({
+                                type: 'error',
+                                error: {
+                                    type: 'api_error',
+                                    message: terminalError.data?.message || terminalError.message || 'OpenCode provider error'
+                                }
+                            });
+                            writeEvent({ type: 'message_stop' });
+                            res.end();
+                            return;
+                        }
 
                         writeEvent({
                             type: 'message_start',
@@ -2970,7 +3005,7 @@ export function createApp(config) {
 
                     if (error.code === 'model_not_found') {
                         if (!res.headersSent) {
-                            return anthropicError(400, 'model_not_found', error.message || `Model not found: ${model}`);
+                            return anthropicError(400, 'model_not_found', error.message || `Model not found: ${req.body?.model}`);
                         }
                     }
                     if (!res.headersSent) {
