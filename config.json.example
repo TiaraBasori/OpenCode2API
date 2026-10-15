@@ -12,5 +12,6 @@
     "DEBUG": false,
     "OPENCODE_SERVER_URL": "http://127.0.0.1:10001",
     "OPENCODE_PATH": "opencode",
-    "REQUEST_TIMEOUT_MS": 180000
+    "REQUEST_TIMEOUT_MS": 180000,
+    "WEB_PANEL_ENABLED": false
 }

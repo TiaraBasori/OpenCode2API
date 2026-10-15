@@ -13,6 +13,7 @@ import { fileURLToPath } from 'url';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
+import { PANEL_HTML } from './panel-page.js';
 import {
     stripFunctionCallMarkup,
     parseExternalToolCallsFromText,
@@ -567,7 +568,8 @@ export function createApp(config) {
         CLEANUP_MAX_AGE_MS,
         OPENCODE_HOME_BASE,
         EVENT_IDLE_TIMEOUT_MS = DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-        EVENT_FIRST_DELTA_TIMEOUT_MS = DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS
+        EVENT_FIRST_DELTA_TIMEOUT_MS = DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+        WEB_PANEL_ENABLED = false
     } = config;
 
     const app = express();
@@ -585,6 +587,18 @@ export function createApp(config) {
     // Auth middleware
     app.use((req, res, next) => {
         if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
+        if (req.path === '/panel' || req.path === '/panel/keys.json') {
+            // Disabled panel: the routes do not exist (404) regardless of auth.
+            if (!WEB_PANEL_ENABLED) {
+                return res.status(404).json({
+                    error: { message: `Route not found: ${req.method} ${req.path}`, type: 'not_found_error' }
+                });
+            }
+            // Enabled: both GET endpoints gate themselves — /panel is a static
+            // shell without data, /panel/keys.json enforces the diagnostics
+            // auth (PUBLIC_DIAGNOSTICS / Bearer) inside its handler.
+            if (req.method === 'GET') return next();
+        }
         if (API_KEY && API_KEY.trim() !== '') {
             const authHeader = req.headers.authorization;
             if (!authHeader || authHeader !== `Bearer ${API_KEY}`) {
@@ -593,6 +607,21 @@ export function createApp(config) {
         }
         next();
     });
+
+    // Shared gate for the panel and diagnostics endpoints: PUBLIC_DIAGNOSTICS
+    // lifts auth, an empty API_KEY means the proxy has no auth at all, and a
+    // configured API_KEY requires the exact Bearer value.
+    const hasValidBearerAuth = (req) => {
+        if (!API_KEY || API_KEY.trim() === '') return true;
+        const authHeader = req.headers.authorization;
+        return Boolean(authHeader && authHeader === `Bearer ${API_KEY}`);
+    };
+
+    const shouldAllowOperationalEndpoint = (req, { enabled }) => {
+        if (!enabled) return false;
+        if (PUBLIC_DIAGNOSTICS) return true;
+        return hasValidBearerAuth(req);
+    };
 
     const getProvidersList = async () => {
         const providersRes = await client.config.providers();
@@ -2425,22 +2454,65 @@ export function createApp(config) {
         }
     });
 
-    const hasValidBearerAuth = (req) => {
-        if (!API_KEY || API_KEY.trim() === '') return true;
-        const authHeader = req.headers.authorization;
-        return Boolean(authHeader && authHeader === `Bearer ${API_KEY}`);
-    };
-
-    const shouldAllowOperationalEndpoint = (req, { enabled }) => {
-        if (!enabled) return false;
-        if (PUBLIC_DIAGNOSTICS) return true;
-        return hasValidBearerAuth(req);
-    };
-
     app.get('/health', (_req, res) => res.json({
         status: 'ok',
         proxy: true
     }));
+
+    // --- Built-in Web Panel (optional, read-only) ---
+    // GET /panel serves a self-contained HTML shell (no data, no secrets).
+    // The page's script fetches /panel/keys.json, which assembles everything
+    // from data the proxy already exposes: /v1/models, /health/details and
+    // process.uptime(). It never returns OPENCODE_SERVER_PASSWORD,
+    // ZEN_API_KEY, API_KEY or API_KEYS values.
+    if (WEB_PANEL_ENABLED) {
+        app.get('/panel', (_req, res) => {
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.send(PANEL_HTML);
+        });
+
+        app.get('/panel/keys.json', async (req, res) => {
+            if (!shouldAllowOperationalEndpoint(req, { enabled: true })) {
+                return res.status(401).json({ error: { message: 'Unauthorized' } });
+            }
+            const payload = {
+                status: 'ok',
+                proxy: true,
+                uptime: process.uptime(),
+                backend_url: OPENCODE_SERVER_URL,
+                public_diagnostics: PUBLIC_DIAGNOSTICS === true,
+                models: [],
+                health: null,
+                usage: null
+            };
+            try {
+                payload.models = buildModelsList(await getProvidersList());
+            } catch (e) {
+                logDebug('Panel model list failed', { error: e.message });
+            }
+            if (HEALTH_DETAILS_ENABLED) {
+                payload.health = {
+                    status: 'ok',
+                    proxy: true,
+                    internal_tools: {
+                        config: { allowed_tools: SERVER_INTERNAL_ALLOWED_TOOL_NAMES },
+                        metrics: { ...internalToolMetrics },
+                        cache: {
+                            tool_ids_cached: !!cachedToolIds,
+                            tool_id_count: cachedToolIds ? cachedToolIds.length : 0,
+                            age_ms: cachedToolIdsAt ? Date.now() - cachedToolIdsAt : null
+                        }
+                    }
+                };
+            }
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.json(payload);
+        });
+    }
 
     app.get('/health/details', (req, res) => {
         if (!shouldAllowOperationalEndpoint(req, { enabled: HEALTH_DETAILS_ENABLED })) {
@@ -3490,6 +3562,9 @@ export function startProxy(options) {
             false,
         CLEANUP_INTERVAL_MS: Number.isFinite(cleanupIntervalMs) && cleanupIntervalMs > 0 ? cleanupIntervalMs : 12 * 60 * 60 * 1000,
         CLEANUP_MAX_AGE_MS: Number.isFinite(cleanupMaxAgeMs) && cleanupMaxAgeMs > 0 ? cleanupMaxAgeMs : 24 * 60 * 60 * 1000,
+        WEB_PANEL_ENABLED: normalizeBool(options.WEB_PANEL_ENABLED) ??
+            normalizeBool(process.env.OPENCODE_WEB_PANEL_ENABLED) ??
+            false,
         OPENCODE_HOME_BASE: options.OPENCODE_HOME_BASE || null,
         EVENT_IDLE_TIMEOUT_MS: options.EVENT_IDLE_TIMEOUT_MS,
         EVENT_FIRST_DELTA_TIMEOUT_MS: options.EVENT_FIRST_DELTA_TIMEOUT_MS

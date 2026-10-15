@@ -45,7 +45,8 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 |:---------|:------------|:-------|:-----|
 | `OPENCODE_HEALTH_DETAILS_ENABLED` | `HEALTH_DETAILS_ENABLED` | `true` | Expose `/health/details` |
 | `OPENCODE_METRICS_ENABLED` | `METRICS_ENABLED` | `false` | Expose `/metrics` |
-| `OPENCODE_PUBLIC_DIAGNOSTICS` | `PUBLIC_DIAGNOSTICS` | `false` | `true` makes `/health/details` and `/metrics` public (default: Bearer auth) |
+| `OPENCODE_PUBLIC_DIAGNOSTICS` | `PUBLIC_DIAGNOSTICS` | `false` | `true` makes `/health/details`, `/metrics` and the web panel data endpoint public (default: Bearer auth) |
+| `OPENCODE_WEB_PANEL_ENABLED` | `WEB_PANEL_ENABLED` | `false` | Serve the built-in web panel at `/panel` |
 | `OPENCODE_PROXY_DEBUG` | `DEBUG` | `false` | Debug logs |
 | `OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS` | - | `30000` | First-delta timeout for streaming |
 | `OPENCODE2API_EVENT_IDLE_TIMEOUT_MS` | - | `8000` | Idle timeout for streaming |
@@ -145,6 +146,15 @@ opencode_internal_tool_discovery_failures_total
 opencode_internal_tool_fallback_disabled_total
 opencode_internal_tool_cache_ids
 ```
+
+## 🖥️ Web Panel
+
+An optional read-only dashboard served by the proxy itself. Off by default; enable with `OPENCODE_WEB_PANEL_ENABLED=true` (or `"WEB_PANEL_ENABLED": true` in config.json).
+
+- `GET /panel` — a self-contained dark-themed HTML page (no external CSS/JS, CSP locked to same-origin). It shows the runtime status (status, uptime, backend URL), the model list, usage by key when usage data exists, and backend diagnostics from `/health/details` (tool-mode counters, tool ID cache). The page stores the key you enter in the browser's localStorage and calls `GET /panel/keys.json` with it.
+- `GET /panel/keys.json` — the JSON feed behind the page: `models`, `health` (the `/health/details` payload), `uptime` and `backend_url`. It never returns `OPENCODE_SERVER_PASSWORD`, `ZEN_API_KEY`, `API_KEY` or `API_KEYS` values.
+
+Authentication follows the diagnostics rules: with `API_KEY` set, `/panel/keys.json` requires `Authorization: Bearer <API_KEY>` (the HTML shell at `/panel` is public but contains no data), and `PUBLIC_DIAGNOSTICS=true` or an empty `API_KEY` lifts the auth. When the panel is disabled, both routes return `404`.
 
 ## ⭐ Recommended Configs
 
