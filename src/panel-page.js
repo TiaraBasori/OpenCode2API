@@ -11,6 +11,8 @@
  * NOTE: this file is a template literal — it must not contain backticks or
  * "${" sequences, and the page script must not contain "</script>".
  */
+export const PANEL_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+
 export const PANEL_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -95,6 +97,9 @@ button:hover { background: #30363d; }
     }
     function saveKey(key) {
         try { localStorage.setItem(KEY_STORAGE, key); } catch (e) { /* storage unavailable */ }
+    }
+    function clearKey() {
+        try { localStorage.removeItem(KEY_STORAGE); } catch (e) { /* storage unavailable */ }
     }
     function fmtUptime(seconds) {
         var s = Math.floor(Number(seconds) || 0);
@@ -190,6 +195,7 @@ button:hover { background: #30363d; }
         fetch('/panel/data.json', { headers: headers, cache: 'no-store' })
             .then(function (res) {
                 if (res.status === 401) {
+                    if (key) clearKey();
                     showAuth('This panel requires the proxy API key.');
                     return null;
                 }

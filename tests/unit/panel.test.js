@@ -102,6 +102,8 @@ describe('Web Panel', () => {
         expect(res.headers['content-type']).toContain('text/html');
         expect(res.headers['cache-control']).toEqual('no-store');
         expect(res.headers['x-content-type-options']).toEqual('nosniff');
+        expect(res.headers['content-security-policy']).toContain("default-src 'none'");
+        expect(res.headers['content-security-policy']).toContain("frame-ancestors 'none'");
         expect(res.text).toContain('<!DOCTYPE html>');
         // No secrets and no key material may reach the page source.
         expect(res.text).not.toContain('test-key');

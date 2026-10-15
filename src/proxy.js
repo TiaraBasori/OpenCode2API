@@ -13,7 +13,7 @@ import { fileURLToPath } from 'url';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
-import { PANEL_HTML } from './panel-page.js';
+import { PANEL_CSP, PANEL_HTML } from './panel-page.js';
 import {
     stripFunctionCallMarkup,
     parseExternalToolCallsFromText,
@@ -610,11 +610,22 @@ export function createApp(config) {
 
     // Shared gate for the panel and diagnostics endpoints: PUBLIC_DIAGNOSTICS
     // lifts auth, an empty API_KEY means the proxy has no auth at all, and a
-    // configured API_KEY requires the exact Bearer value.
+    // configured API_KEY requires the exact Bearer value (constant-time).
     const hasValidBearerAuth = (req) => {
         if (!API_KEY || API_KEY.trim() === '') return true;
         const authHeader = req.headers.authorization;
-        return Boolean(authHeader && authHeader === `Bearer ${API_KEY}`);
+        if (typeof authHeader !== 'string' || !authHeader.startsWith('Bearer ')) return false;
+        const token = authHeader.slice('Bearer '.length).trim();
+        if (!token) return false;
+        const bufA = Buffer.from(token);
+        const bufB = Buffer.from(API_KEY.trim());
+        if (bufA.length !== bufB.length) {
+            const hashA = crypto.createHash('sha256').update(bufA).digest();
+            const hashB = crypto.createHash('sha256').update(bufB).digest();
+            crypto.timingSafeEqual(hashA, hashB);
+            return false;
+        }
+        return crypto.timingSafeEqual(bufA, bufB);
     };
 
     const shouldAllowOperationalEndpoint = (req, { enabled }) => {
@@ -2470,6 +2481,7 @@ export function createApp(config) {
             res.setHeader('Content-Type', 'text/html; charset=utf-8');
             res.setHeader('Cache-Control', 'no-store');
             res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.setHeader('Content-Security-Policy', PANEL_CSP);
             res.send(PANEL_HTML);
         });
 
