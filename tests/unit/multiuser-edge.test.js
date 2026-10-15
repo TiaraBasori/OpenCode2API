@@ -11,6 +11,29 @@ const sdkMocks = {
     eventSubscribe: jest.fn()
 };
 
+// checkHealth() probes OPENCODE_SERVER_URL over http; without this mock the
+// request hits the real network and every business request hangs in
+// ensureBackend() until the 25s lock timeout on any machine without a
+// passwordless 1.x backend on 127.0.0.1:10001.
+jest.unstable_mockModule('http', () => ({
+    default: {
+        get: jest.fn((url, options, callback) => {
+            const response = {
+                statusCode: 200,
+                headers: {},
+                resume: jest.fn(),
+                setEncoding: jest.fn(),
+                on: jest.fn((event, handler) => {
+                    if (event === 'data') handler('{"healthy":true,"version":"1.19.0"}');
+                    if (event === 'end') handler();
+                })
+            };
+            callback(response);
+            return { on: jest.fn(), destroy: jest.fn(), setTimeout: jest.fn() };
+        })
+    }
+}));
+
 jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     createOpencodeClient: jest.fn(() => ({
         config: { providers: sdkMocks.configProviders, update: sdkMocks.configUpdate },
