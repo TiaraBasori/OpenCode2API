@@ -206,4 +206,31 @@ describe('multiuser edge review', () => {
         expect(userDetails.status).toBe(200);
         expect(Object.keys(userDetails.body.usage.byKey)).toEqual(['alice']);
     });
+
+    test('multi-user mode with empty API_KEY rejects unauthenticated and wrong-key business requests', async () => {
+        const cfg = { ...baseConfig(), API_KEY: '' };
+        const { app } = createApp(cfg);
+        const noAuth = await request(app).post('/v1/chat/completions')
+            .send({ model: 'opencode/m', messages: [{ role: 'user', content: 'hi' }] });
+        expect(noAuth.status).toBe(401);
+
+        const wrongKey = await request(app).post('/v1/chat/completions')
+            .set('Authorization', 'Bearer wrong-key-value')
+            .send({ model: 'opencode/m', messages: [{ role: 'user', content: 'hi' }] });
+        expect(wrongKey.status).toBe(401);
+    });
+
+    test('rejects user keys that duplicate the admin API_KEY at startup and via POST /admin/keys', async () => {
+        const cfg = baseConfig();
+        expect(() => createApp({
+            ...cfg,
+            API_KEYS: [{ name: 'clash', key: cfg.API_KEY }]
+        })).toThrow(/API_KEY/i);
+
+        const { app } = createApp(cfg);
+        const res = await request(app).post('/admin/keys')
+            .set('Authorization', `Bearer ${cfg.API_KEY}`)
+            .send({ name: 'clash', key: cfg.API_KEY });
+        expect(res.status).toBe(400);
+    });
 });

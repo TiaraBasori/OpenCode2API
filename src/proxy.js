@@ -837,11 +837,29 @@ export function createApp(config) {
     // here so a bad config fails at startup instead of per request. The legacy
     // single API_KEY keeps working for every path (it is also the admin key).
     const apiKeyEntries = parseApiKeysConfig(API_KEYS);
-    const apiKeyByName = new Map(apiKeyEntries.map((entry) => [entry.name, entry.key]));
-    const apiKeyToName = new Map(apiKeyEntries.map((entry) => [entry.key, entry.name]));
-    const multiUserEnabled = apiKeyEntries.length > 0;
     const adminAuthEnabled = Boolean(API_KEY && API_KEY.trim() !== '');
+    if (adminAuthEnabled) {
+        const masterKey = API_KEY.trim();
+        for (const entry of apiKeyEntries) {
+            if (safeTokenEquals(entry.key, masterKey)) {
+                throw new Error(`[Config] API_KEYS entry "${entry.name}" must not use the same key value as API_KEY (the admin key)`);
+            }
+        }
+    }
+    const apiKeyByName = new Map(apiKeyEntries.map((entry) => [entry.name, entry.key]));
+    const multiUserEnabled = apiKeyEntries.length > 0;
     const keyUsage = createKeyUsageRegistry(apiKeyEntries);
+
+    const findMatchingUserKeyName = (token) => {
+        if (!token || !multiUserEnabled) return null;
+        let matchedName = null;
+        for (const entry of apiKeyEntries) {
+            if (safeTokenEquals(token, entry.key)) {
+                matchedName = entry.name;
+            }
+        }
+        return matchedName;
+    };
 
     const app = express();
     app.use(cors({
@@ -865,11 +883,13 @@ export function createApp(config) {
     // Auth middleware
     app.use((req, res, next) => {
         if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
+        if (multiUserEnabled && (req.path === '/admin/keys' || req.path.startsWith('/admin/keys/'))) return next();
         const token = extractBearerToken(req);
         if (multiUserEnabled) {
             // API_KEYS hit wins and tags the request for per-key metering.
-            if (token && apiKeyToName.has(token)) {
-                req.apiKeyName = apiKeyToName.get(token);
+            const matchedUserKeyName = findMatchingUserKeyName(token);
+            if (matchedUserKeyName) {
+                req.apiKeyName = matchedUserKeyName;
                 return next();
             }
         }
@@ -880,6 +900,9 @@ export function createApp(config) {
                 req.apiKeyName = MASTER_KEY_NAME;
                 return next();
             }
+            return res.status(401).json({ error: { message: 'Unauthorized' } });
+        }
+        if (multiUserEnabled) {
             return res.status(401).json({ error: { message: 'Unauthorized' } });
         }
         next();
@@ -2736,8 +2759,9 @@ export function createApp(config) {
         if (adminAuthEnabled && token && safeTokenEquals(token, API_KEY.trim())) {
             return { allowed: true, role: 'admin', keyName: MASTER_KEY_NAME };
         }
-        if (multiUserEnabled && token && apiKeyToName.has(token)) {
-            return { allowed: true, role: 'user', keyName: apiKeyToName.get(token) };
+        const matchedUserKeyName = findMatchingUserKeyName(token);
+        if (matchedUserKeyName) {
+            return { allowed: true, role: 'user', keyName: matchedUserKeyName };
         }
         if (PUBLIC_DIAGNOSTICS) {
             return { allowed: true, role: 'public', keyName: null };
@@ -2817,6 +2841,9 @@ export function createApp(config) {
             if (apiKeyByName.has(cleanName)) {
                 return res.status(400).json({ error: { message: `Key name "${cleanName}" already exists` } });
             }
+            if (adminAuthEnabled && safeTokenEquals(key, API_KEY.trim())) {
+                return res.status(400).json({ error: { message: 'Key value must not match the admin API_KEY' } });
+            }
             for (const entry of apiKeyEntries) {
                 if (safeTokenEquals(key, entry.key)) {
                     return res.status(400).json({ error: { message: 'Key value already exists' } });
@@ -2824,7 +2851,6 @@ export function createApp(config) {
             }
             apiKeyEntries.push({ name: cleanName, key });
             apiKeyByName.set(cleanName, key);
-            apiKeyToName.set(key, cleanName);
             keyUsage.register(cleanName);
             const created = buildUsageRows().rows.find((row) => row.name === cleanName);
             res.status(201).json(created);
@@ -2838,7 +2864,6 @@ export function createApp(config) {
             }
             const [removed] = apiKeyEntries.splice(index, 1);
             apiKeyByName.delete(removed.name);
-            apiKeyToName.delete(removed.key);
             keyUsage.delete(removed.name);
             res.status(204).end();
         });

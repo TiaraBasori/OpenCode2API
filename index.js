@@ -133,9 +133,10 @@ if (!finalConfig.OPENCODE_PATH) {
 // Fail fast on a malformed multi-user key configuration (duplicates, missing
 // keys, bad shapes) instead of discovering it per request. startProxy would
 // also surface this, but exiting here gives a clear startup error.
+let parsedApiKeys = [];
 try {
     if (finalConfig.API_KEYS !== undefined) {
-        const parsedApiKeys = parseApiKeysConfig(finalConfig.API_KEYS);
+        parsedApiKeys = parseApiKeysConfig(finalConfig.API_KEYS);
         if (parsedApiKeys.length > 0) {
             console.log(`[Config] API_KEYS: ${parsedApiKeys.length} user key(s) configured (${parsedApiKeys.map((entry) => entry.name).join(', ')})`);
         }
@@ -165,7 +166,7 @@ console.log(`  - Backend: ${finalConfig.OPENCODE_SERVER_URL}`);
 console.log(`  - Backend Password: ${finalConfig.OPENCODE_SERVER_PASSWORD ? 'Configured' : 'Not configured'}`);
 console.log(`  - OpenCode Path: ${finalConfig.OPENCODE_PATH}`);
 console.log(`  - API Key: ${finalConfig.API_KEY ? 'Configured' : 'Not configured (no auth)'}`);
-console.log(`  - API Keys (multi-user): ${Array.isArray(finalConfig.API_KEYS) && finalConfig.API_KEYS.length > 0 ? `${finalConfig.API_KEYS.length} user key(s)` : 'Not configured'}`);
+console.log(`  - API Keys (multi-user): ${parsedApiKeys.length > 0 ? `${parsedApiKeys.length} user key(s)` : 'Not configured'}`);
 console.log(`  - Zen API Key: ${finalConfig.ZEN_API_KEY ? 'Configured' : 'Not configured'}`);
 console.log(`  - Disable Tools: ${finalConfig.DISABLE_TOOLS ? 'Yes' : 'No'}`);
 console.log(`  - Chat Session Affinity: ${finalConfig.CHAT_SESSION_AFFINITY ? 'Yes' : 'No (new session per request)'}`);
