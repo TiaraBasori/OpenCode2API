@@ -45,6 +45,7 @@ const sdkMocks = {
         }
     ])),
     sessionDelete: jest.fn(async () => ({})),
+    sessionAbort: jest.fn(async () => ({ data: true })),
     eventSubscribe: jest.fn(async () => {
         const sessionId = 'test-session-id';
         const mockEvents = [
@@ -123,7 +124,8 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             create: sdkMocks.sessionCreate,
             prompt: sdkMocks.sessionPrompt,
             messages: sdkMocks.sessionMessages,
-            delete: sdkMocks.sessionDelete
+            delete: sdkMocks.sessionDelete,
+            abort: sdkMocks.sessionAbort
         },
         event: {
             subscribe: sdkMocks.eventSubscribe
@@ -1102,9 +1104,7 @@ describe('Proxy OpenAI API', () => {
         expect(streamed).toContain('Done: 42.');
     });
 
-    test('polling fallback returns the last partial snapshot when the timeout is reached', async () => {
-        // If the message never reports completion, the partial text still beats throwing a
-        // timeout error and losing everything the model produced.
+    test('polling fallback reports a timeout instead of succeeding with an unfinished snapshot', async () => {
         sdkMocks.sessionMessages.mockImplementation(async () => ([{
             info: { role: 'assistant' },
             parts: [{ type: 'text', text: 'Partial answer that never completes' }]
@@ -1131,8 +1131,10 @@ describe('Proxy OpenAI API', () => {
                 stream: true
             });
 
-        expect(res.statusCode).toEqual(200);
-        expect(res.text).toContain('Partial answer that never completes');
+        expect(res.statusCode).toEqual(504);
+        expect(res.body.error).toBeDefined();
+        expect(res.text).not.toContain('"finish_reason":"stop"');
+        expect(sdkMocks.sessionAbort).toHaveBeenCalledWith(expect.objectContaining({ path: { id: 'test-session-id' } }));
     });
 
     test('streaming surfaces an upstream message error without waiting out the first-delta window', async () => {
@@ -1170,7 +1172,7 @@ describe('Proxy OpenAI API', () => {
                 stream: true
             });
 
-        expect(res.statusCode).toEqual(200);
+        expect(res.statusCode).toEqual(502);
         expect(res.text).toContain('MessageAbortedError');
         // Must not have burned the full first-delta window (30s by default).
         expect(Date.now() - startedAt).toBeLessThan(5000);
@@ -2257,8 +2259,9 @@ describe('Proxy Responses API previous_response_id', () => {
         expect(sdkMocks.sessionCreate).toHaveBeenCalledTimes(1);
         expect(sdkMocks.sessionDelete).not.toHaveBeenCalled();
         // Model falls back to the one recorded with the previous response.
-        const lastUpdate = sdkMocks.configUpdate.mock.calls.at(-1)?.[0];
-        expect(lastUpdate?.body?.activeModel).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.5' });
+        const lastPrompt = sdkMocks.sessionPrompt.mock.calls.at(-1)?.[0];
+        expect(lastPrompt?.body?.model).toEqual({ providerID: 'opencode', modelID: 'kimi-k2.5' });
+        expect(sdkMocks.configUpdate).not.toHaveBeenCalled();
     });
 
     test('rejects an invalid previous_response_id', async () => {

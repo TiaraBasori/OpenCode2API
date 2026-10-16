@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Client tool handoff and request lifecycle**: deduplicate mirrored tool markup without dropping distinct explicit call IDs; hand off registered native tools only after the tool-lock plugin denies them and argument validation succeeds. Invalid external calls get at most one text-contract correction. Chat, Responses, and Messages now share one request deadline across event collection, retries, and polling, abort backend sessions on cancellation or unanswered permission requests, and report unfinished responses as errors rather than successful partial completions. Model selection stays request-local instead of mutating backend global configuration. Responses completion envelopes include `status` and `created_at`.
+
 ### Added
 
 - **Multi-User API Keys & Per-Key Usage (`API_KEYS` / `OPENCODE_API_KEYS`)**: configure a list of named user keys — a `[{name, key}]` array in config.json or a comma-separated `name:key` string in the environment (bare keys are auto-named `key-N`; duplicates fail at startup). Requests matching any user key authenticate like `API_KEY` and are metered per name in an in-memory registry (`requests`, prompt/completion/total tokens using the existing chars/4 estimation, `lastUsedAt`; failed requests count toward `requests` but never tokens). New admin endpoints `GET`/`POST`/`DELETE /admin/keys` (mounted once `API_KEYS` is set, admin-authenticated with the legacy `API_KEY` — user keys get 401, no `PUBLIC_DIAGNOSTICS` bypass, `501` when `API_KEY` is empty) let operators hot-add or revoke keys at runtime; `GET` responses expose only a `keyHint` with the key's last 4 characters. `/health/details` gains a `usage: {byKey, total}` section and `/metrics` emits `opencode_proxy_key_requests_total{key}` / `opencode_proxy_key_tokens_total{key,type}` in multi-user mode only — single-key deployments keep their exact previous behavior and snapshot shapes.

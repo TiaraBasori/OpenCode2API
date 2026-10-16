@@ -27,6 +27,7 @@ const sdkMocks = {
         }
     ])),
     sessionDelete: jest.fn(async () => ({})),
+    sessionAbort: jest.fn(async () => ({ data: true })),
     eventSubscribe: jest.fn(async () => {
         const sessionId = 'test-session-id';
         const mockEvents = [
@@ -90,7 +91,8 @@ jest.unstable_mockModule('@opencode-ai/sdk', () => ({
             create: sdkMocks.sessionCreate,
             prompt: sdkMocks.sessionPrompt,
             messages: sdkMocks.sessionMessages,
-            delete: sdkMocks.sessionDelete
+            delete: sdkMocks.sessionDelete,
+            abort: sdkMocks.sessionAbort
         },
         event: { subscribe: sdkMocks.eventSubscribe }
     }))

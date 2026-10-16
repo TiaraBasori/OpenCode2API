@@ -541,8 +541,8 @@ function collectAll(text, registry) {
     results.forEach((result) => {
         result.calls.forEach((call) => {
             // Distinct formats can describe the same call (e.g. a tag wrapping JSON that
-            // also names the tool); keep one entry per name+arguments pair.
-            const key = `${call.name}::${JSON.stringify(call.arguments)}`;
+            // also names the tool); explicit IDs preserve intentional equal-argument calls.
+            const key = call.id ? `id:${call.id}` : `${call.name}::${JSON.stringify(call.arguments)}`;
             if (seen.has(key)) return;
             seen.add(key);
             calls.push(call);
@@ -609,13 +609,18 @@ export function parseExternalToolCallsFromText(registry, ...chunks) {
     });
 
     const counts = new Map();
+    const seenCalls = new Set();
     return rawCalls.flatMap((rawCall) => {
         const tool = findExternalToolByName(registry, rawCall.name);
         if (!tool) return [];
+        const key = rawCall.id ? 'id:' + rawCall.id : tool.originalName + ':' + JSON.stringify(rawCall.arguments);
+        if (seenCalls.has(key)) return [];
+        seenCalls.add(key);
         const nextCount = (counts.get(tool.namespacedName) || 0) + 1;
         counts.set(tool.namespacedName, nextCount);
         return [{
             id: rawCall.id || `call_${tool.namespacedName.replace(/[^a-zA-Z0-9_]/g, '_')}_${nextCount}`,
+            sourceId: rawCall.id || null,
             type: 'function',
             function: {
                 name: tool.originalName,

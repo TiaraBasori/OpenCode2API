@@ -1,4 +1,5 @@
 import express from 'express';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import { spawn } from 'child_process';
@@ -18,8 +19,7 @@ import { PANEL_CSP, PANEL_HTML } from './panel-page.js';
 import {
     stripFunctionCallMarkup,
     parseExternalToolCallsFromText,
-    createToolCallFilter,
-    createExternalToolCallStreamParser
+    createToolCallFilter
 } from './tool-runtime/parser.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -39,6 +39,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  */
 function isTransientUpstreamError(error) {
     if (!error) return false;
+    if (['request_timeout', 'client_disconnected', 'tool_handoff_failed', 'backend_permission_required'].includes(error.code)) return false;
     const message = [error.message, error.data?.message]
         .filter((part) => typeof part === 'string')
         .join(' ');
@@ -85,7 +86,7 @@ function transformUpstreamError(error) {
     let code = error.code || error.constructor.name;
 
     // Handle timeout errors
-    if (error.message && error.message.includes('Request timeout')) {
+    if (error.code === 'request_timeout' || (error.message && error.message.includes('Request timeout'))) {
         statusCode = 504;
         type = 'timeout';
         code = 'timeout';
@@ -874,7 +875,153 @@ export function createApp(config) {
     app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
 
     const clientHeaders = buildBackendAuthHeaders(OPENCODE_SERVER_PASSWORD);
-    const client = createOpencodeClient({ baseUrl: OPENCODE_SERVER_URL, headers: clientHeaders });
+    const requests = new AsyncLocalStorage();
+    const requestError = (message, statusCode = 504, code = 'request_timeout') => Object.assign(new Error(message), { statusCode, code });
+    const remainingTime = () => {
+        const context = requests.getStore();
+        context?.controller.signal.throwIfAborted();
+        return context ? Math.max(1, context.deadline - Date.now()) : REQUEST_TIMEOUT_MS;
+    };
+    const abortSession = async (sessionId) => {
+        if (!sessionId) return;
+        const context = requests.getStore();
+        if (context?.abortedSessions.has(sessionId)) return context.abortedSessions.get(sessionId);
+        const operation = (async () => {
+            try {
+                const response = await client.session.abort({ path: { id: sessionId }, signal: AbortSignal.timeout(2000) });
+                if (response.error) throw new Error(JSON.stringify(response.error));
+            } catch (error) {
+                console.error('[Proxy] Backend abort failed:', sessionId, error.message);
+            } finally {
+                context?.promptControllers.get(sessionId)?.abort();
+            }
+        })();
+        context?.abortedSessions.set(sessionId, operation);
+        return operation;
+    };
+    const client = createOpencodeClient({
+        baseUrl: OPENCODE_SERVER_URL,
+        headers: clientHeaders,
+        fetch: async (request) => {
+            const context = requests.getStore();
+            const match = new URL(request.url).pathname.match(/^\/session\/([^/]+)\/message$/);
+            let promptController;
+            if (context && match && request.method === 'POST') {
+                promptController = new AbortController();
+                context.promptControllers.set(decodeURIComponent(match[1]), promptController);
+            }
+            const isAbort = new URL(request.url).pathname.endsWith('/abort');
+            const controller = new AbortController();
+            const signals = [request.signal, ...(!isAbort && context ? [context.controller.signal] : []), ...(promptController ? [promptController.signal] : [])];
+            const listeners = signals.map(signal => {
+                const onAbort = () => controller.abort(signal.reason);
+                if (signal.aborted) onAbort();
+                else signal.addEventListener('abort', onAbort, { once: true });
+                return () => signal.removeEventListener('abort', onAbort);
+            });
+            const timer = setTimeout(() => controller.abort(requestError('Backend request timed out')), isAbort ? 2000 : context ? remainingTime() : 10000);
+            const cleanup = () => {
+                clearTimeout(timer);
+                listeners.forEach(remove => remove());
+                context?.cleanups.delete(cleanup);
+            };
+            context?.cleanups.add(cleanup);
+            try {
+                return await fetch(new Request(request, { signal: controller.signal }));
+            } catch (error) {
+                cleanup();
+                throw error;
+            } finally {
+                if (!context) cleanup();
+            }
+        }
+    });
+    const runRequest = async (req, res, task) => {
+        const context = {
+            controller: new AbortController(), deadline: Date.now() + REQUEST_TIMEOUT_MS,
+            sessionIds: new Set(), abortedSessions: new Map(), promptControllers: new Map(), cleanups: new Set(),
+            registry: [], protocol: req.path === '/v1/responses' ? 'responses' : req.path === '/v1/messages' ? 'messages' : 'chat', completed: false
+        };
+        return requests.run(context, async () => {
+            const cancel = (error) => {
+                if (context.completed || context.controller.signal.aborted) return;
+                context.controller.abort(error);
+                for (const sessionId of context.sessionIds) void abortSession(sessionId);
+            };
+            const onClose = () => { if (!res.writableEnded) cancel(requestError('Client disconnected', 499, 'client_disconnected')); };
+            res.once('close', onClose);
+            const timer = setTimeout(() => cancel(requestError('Request deadline exceeded after ' + REQUEST_TIMEOUT_MS + 'ms')), REQUEST_TIMEOUT_MS);
+            let onAbort;
+            const cancelled = new Promise((_, reject) => {
+                onAbort = () => reject(context.controller.signal.reason);
+                context.controller.signal.addEventListener('abort', onAbort, { once: true });
+            });
+            try {
+                if (req.aborted || res.destroyed) cancel(requestError('Client disconnected', 499, 'client_disconnected'));
+                context.controller.signal.throwIfAborted();
+                return await Promise.race([Promise.resolve().then(task), cancelled]);
+            } catch (error) {
+                await Promise.allSettled([...context.sessionIds].map(abortSession));
+                if (!res.destroyed && !res.writableEnded) {
+                    const anthropicError = { type: 'error', error: { type: 'api_error', message: error.message } };
+                    if (!res.headersSent) {
+                        res.type('application/json');
+                        res.status(error.statusCode || 500).json(context.protocol === 'messages' ? anthropicError : { error: { message: error.message, code: error.code || 'upstream_error' } });
+                    } else {
+                        const payload = context.protocol === 'messages' ? anthropicError : context.protocol === 'responses'
+                            ? { type: 'response.failed', response: { object: 'response', status: 'failed', error: { message: error.message, code: error.code || 'upstream_error' } } }
+                            : { error: { message: error.message, code: error.code || 'upstream_error' } };
+                        res.write((context.protocol === 'messages' ? 'event: error\n' : '') + 'data: ' + JSON.stringify(payload) + '\n\n');
+                        if (context.protocol !== 'messages') res.write('data: [DONE]\n\n');
+                        res.end();
+                    }
+                }
+                throw error;
+            } finally {
+                context.completed = true;
+                for (const controller of context.promptControllers.values()) controller.abort();
+                clearTimeout(timer);
+                res.off('close', onClose);
+                context.controller.signal.removeEventListener('abort', onAbort);
+                await Promise.allSettled([...context.abortedSessions.values()]);
+                for (const cleanup of context.cleanups) cleanup();
+            }
+        });
+    };
+    const toolCallKey = (call) => {
+        const args = JSON.parse(call.function.arguments || '{}');
+        const canonical = value => Array.isArray(value) ? value.map(canonical) : value && typeof value === 'object'
+            ? Object.fromEntries(Object.keys(value).sort().map(key => [key, canonical(value[key])])) : value;
+        return call.sourceId ? 'id:' + call.sourceId : call.function.name + ':' + JSON.stringify(canonical(args));
+    };
+    const uniqueToolCalls = (calls) => {
+        const seen = new Set();
+        return calls.filter(call => {
+            const key = toolCallKey(call);
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
+    };
+    const callsFromSnapshot = (content, reasoning, registry) => {
+        const contentCalls = parseExternalToolCallsFromText(registry, content);
+        const parsed = contentCalls.length ? contentCalls : parseExternalToolCallsFromText(registry, reasoning);
+        const { validCalls } = validateToolCalls(parsed, registry);
+        return uniqueToolCalls(validCalls);
+    };
+    const nativeToolCall = (part, registry) => {
+        if (part?.type !== 'tool' || part.state?.status !== 'error') return null;
+        if (!String(part.state.error || '').includes('disabled by opencode2api')) return null;
+        const tool = findExternalToolByName(registry, part.tool);
+        if (!tool) return null;
+        const args = { ...(part.state.input || {}) };
+        if (tool.originalName === 'Read' && args.filePath && !args.file_path) {
+            args.file_path = args.filePath;
+            delete args.filePath;
+        }
+        const call = { id: 'call_' + crypto.randomUUID(), sourceId: part.callID || part.id, type: 'function', function: { name: tool.originalName, arguments: JSON.stringify(args) } };
+        return validateToolCalls([call], registry).validCalls[0] || null;
+    };
 
     // Extract and validate the Bearer token from a request, if any.
     const extractBearerToken = (req) => {
@@ -1259,7 +1406,8 @@ export function createApp(config) {
     };
 
     const finalizeValidatedToolCalls = (parsedToolCalls, registry) => {
-        const { validCalls, invalidCalls } = validateToolCalls(parsedToolCalls, registry);
+        const { validCalls: rawValidCalls, invalidCalls } = validateToolCalls(parsedToolCalls, registry);
+        const validCalls = uniqueToolCalls(rawValidCalls);
         invalidCalls.forEach(({ call, validation }) => {
             logDebug('Rejected external tool call', {
                 tool: call?.function?.name,
@@ -1308,8 +1456,8 @@ export function createApp(config) {
         if (toolOverrides && Object.keys(toolOverrides).length > 0) {
             forcedPromptParams.body.tools = toolOverrides;
         }
-        await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
-        return pollForAssistantResponse(sessionId, requestTimeoutMs);
+        const result = await promptWithTimeout(forcedPromptParams, requestTimeoutMs);
+        return extractFromParts(result.data.parts);
     };
 
     const TOOL_IDS_CACHE_MS = 5 * 60 * 1000;
@@ -1594,6 +1742,12 @@ export function createApp(config) {
         const sessionRes = await client.session.create(toolControl?.title ? { body: { title: toolControl.title } } : undefined);
         const sessionId = sessionRes?.data?.id;
         if (!sessionId) throw new Error('Failed to create OpenCode session');
+        const context = requests.getStore();
+        context?.sessionIds.add(sessionId);
+        if (context?.controller.signal.aborted) {
+            await abortSession(sessionId);
+            context.controller.signal.throwIfAborted();
+        }
         return sessionId;
     };
 
@@ -1636,11 +1790,43 @@ export function createApp(config) {
         return overrides;
     };
 
+    async function collectPrompt(promptParams, onDelta) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            const collectedPromise = collectFromEvents(promptParams.path.id, remainingTime(), onDelta, EVENT_FIRST_DELTA_TIMEOUT_MS, EVENT_IDLE_TIMEOUT_MS);
+            const safeCollected = collectedPromise.catch(error => ({ __error: error }));
+            let promptResult;
+            const promptedSessionId = promptParams.path.id;
+            const context = requests.getStore();
+            client.session.prompt(promptParams).then(result => { promptResult = result; }).catch(error => {
+                if (!context.completed && !context.abortedSessions.has(promptedSessionId)) context.controller.abort(error);
+            });
+            const collected = await safeCollected;
+            collected.promptResult = promptResult;
+            if (collected.__error?.code !== 'tool_handoff_failed' || attempt > 0 || requests.getStore().correctedToolCall) return collected;
+            requests.getStore().correctedToolCall = true;
+            const sessionId = await createSession({ title: sessionTitleForPolicy('none') });
+            promptParams.path.id = sessionId;
+            promptParams.body.parts = [...promptParams.body.parts, {
+                type: 'text',
+                text: 'The previous native tool attempt was rejected and cancelled. Do not invoke any native tool, including external__ names. To request a client tool, output only the complete <function_calls> JSON contract with its real arguments as answer text, then stop. The client will execute it and return its result.'
+            }];
+        }
+    }
+
     async function promptWithTimeout(promptParams, timeoutMs) {
-        const timeoutPromise = new Promise((_, reject) => {
-            setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
-        });
-        return Promise.race([client.session.prompt(promptParams), timeoutPromise]);
+        const collected = await collectPrompt(promptParams);
+        if (collected.__error) throw collected.__error;
+        const promptData = collected.promptResult?.data;
+        if (requests.getStore()?.protocol === 'responses' && !collected.toolCalls?.length && !collected.error && promptData?.parts) {
+            if (promptData.info?.error) return { data: { ...promptData, error: promptData.info.error } };
+            if (!promptData.info || (promptData.info.finish && !['tool', 'tool-calls'].includes(promptData.info.finish))) return collected.promptResult;
+        }
+        const result = collected.toolCalls?.length || collected.error
+            ? collected : await pollForAssistantResponse(promptParams.path.id, Math.min(timeoutMs, remainingTime()));
+        return { data: { error: result.error, parts: [
+            ...(result.reasoning ? [{ type: 'reasoning', text: result.reasoning }] : []),
+            ...(result.content ? [{ type: 'text', text: result.content }] : [])
+        ] } };
     }
 
     const getCleanupRoots = () => {
@@ -1716,13 +1902,10 @@ export function createApp(config) {
     async function pollForAssistantResponse(sessionId, timeoutMs, intervalMs = DEFAULT_POLL_INTERVAL_MS) {
         const pollStart = Date.now();
         const startedAt = Date.now();
-        // Best-effort snapshot of the most recent in-flight assistant message. Polling
-        // observes partial messages: a reasoning model emits its reasoning part first and
-        // the text part only afterwards, so returning on the first non-empty snapshot
-        // truncates the answer to the reasoning alone. Keep the partial around purely as
-        // a timeout fallback and otherwise wait for the message to actually finish.
-        let lastPartial = null;
+        // Partial reasoning is not a completed answer and must not become a successful response.
+        timeoutMs = Math.min(timeoutMs, remainingTime());
         while (Date.now() - startedAt < timeoutMs) {
+            remainingTime();
             const messagesRes = await client.session.messages({ path: { id: sessionId } });
             const messages = messagesRes?.data || messagesRes || [];
             if (Array.isArray(messages) && messages.length) {
@@ -1734,8 +1917,9 @@ export function createApp(config) {
                     const error = info?.error || null;
                     // finish === 'tool' marks an intermediate turn that pauses for a tool
                     // result; the assistant is not done producing output yet.
-                    const finished = info.finish && info.finish !== 'tool';
-                    const done = Boolean(finished || info.time?.completed || error);
+                    const intermediate = info.finish === 'tool' || info.finish === 'tool-calls';
+                    const activeTools = toolParts.some(part => ['pending', 'running'].includes(part.state?.status));
+                    const done = Boolean(error || (!intermediate && !activeTools && (info.finish || info.time?.completed)));
                     if (toolParts.length > 0) {
                         logDebug('Polling found tool parts', {
                             sessionId,
@@ -1762,259 +1946,154 @@ export function createApp(config) {
                         });
                         return { content, reasoning, error };
                     }
-                    if (content || reasoning) {
-                        lastPartial = { content, reasoning, error: null };
-                    }
                     break;
                 }
             }
             await sleep(intervalMs);
         }
-        if (lastPartial) {
-            logDebug('Polling timeout with partial response', {
-                sessionId,
-                ms: Date.now() - pollStart,
-                contentLen: lastPartial.content.length,
-                reasoningLen: lastPartial.reasoning.length
-            });
-            return lastPartial;
-        }
-        logDebug('Polling timeout', { sessionId, ms: Date.now() - pollStart });
-        throw new Error(`Request timeout after ${timeoutMs}ms`);
+        throw requestError('OpenCode response did not complete before the request deadline');
     }
 
     async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
+        const context = requests.getStore();
+        const registry = context?.registry || [];
         const controller = new AbortController();
-        const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
-        const eventStream = eventStreamResult.stream;
-        let finished = false;
-        let content = '';
-        let reasoning = '';
-        let receivedDelta = false;
-        let deltaChars = 0;
-        let firstDeltaAt = null;
-        // Tracks internal OpenCode tool calls that are still pending/running. While any
-        // tool call is active, the stream must stay open even if no text deltas arrive
-        // (the backend is executing the tool). Resolving early here is what previously
-        // truncated streaming responses that relied on internal tool execution.
-        const activeToolCallIds = new Set();
-        const startedAt = Date.now();
-
-        const finishPromise = new Promise((resolve, reject) => {
-            const timeoutId = setTimeout(() => {
-                if (finished) return;
-                finished = true;
-                controller.abort();
-                reject(new Error(`Request timeout after ${timeoutMs}ms`));
-            }, timeoutMs);
-
-            const firstDeltaTimer = firstDeltaTimeoutMs
-                ? setTimeout(() => {
-                    if (finished || receivedDelta) return;
-                    finished = true;
-                    controller.abort();
-                    logDebug('No event data received', { sessionId, ms: Date.now() - startedAt });
-                    resolve({ content: '', reasoning: '', noData: true });
-                }, firstDeltaTimeoutMs)
-                : null;
-
-            let idleTimer = null;
-            const scheduleIdleTimer = () => {
-                if (!idleTimeoutMs) return;
-                if (idleTimer) clearTimeout(idleTimer);
-                idleTimer = setTimeout(() => {
-                    if (finished) return;
-                    // A tool call is still executing on the backend. Keep the stream open
-                    // and wait instead of cutting the response short; the follow-up text
-                    // (or the final completion) will arrive once the tool finishes.
-                    if (activeToolCallIds.size > 0) {
-                        logDebug('Event idle while internal tool call is active, continuing to wait', {
-                            sessionId,
-                            ms: Date.now() - startedAt,
-                            activeTools: activeToolCallIds.size
-                        });
-                        scheduleIdleTimer();
-                        return;
-                    }
-                    finished = true;
-                    controller.abort();
-                    logDebug('Event idle timeout', {
-                        sessionId,
-                        ms: Date.now() - startedAt,
-                        deltaChars
-                    });
-                    resolve({
-                        content,
-                        reasoning,
-                        idleTimeout: true,
-                        receivedDelta
-                    });
-                }, idleTimeoutMs);
-            };
-
-            const trackToolActivity = (part) => {
-                if (!part || part.type !== 'tool') return;
-                const status = part.state?.status;
-                if (status === 'pending' || status === 'running') {
-                    if (part.id) activeToolCallIds.add(part.id);
-                } else if (status === 'completed' || status === 'error') {
-                    if (part.id) activeToolCallIds.delete(part.id);
-                }
-                // Tool activity means the session is still working; treat it as progress
-                // so the idle timer does not terminate the stream mid-execution.
-                receivedDelta = true;
-                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                scheduleIdleTimer();
-            };
-
-            // Newer OpenCode servers stream deltas as `message.part.delta` events that
-            // carry only a `partID` (no `part.type`). The part type is announced by the
-            // preceding `message.part.updated` event, so we key partID -> type here and
-            // resolve each delta against it. Without this, reasoning and answer text can
-            // never be told apart and the answer is mis-routed (or dropped) entirely.
-            const partTypeById = new Map();
-            const rememberPartType = (part) => {
-                if (part && part.id && typeof part.type === 'string') {
-                    partTypeById.set(part.id, part.type);
-                }
-            };
-            const applyTextDelta = (partType, delta) => {
-                receivedDelta = true;
-                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                scheduleIdleTimer();
-                if (!firstDeltaAt) {
-                    firstDeltaAt = Date.now();
-                    logDebug('SSE first delta', {
-                        sessionId,
-                        ms: firstDeltaAt - startedAt,
-                        type: partType
-                    });
-                }
-                if (partType === 'reasoning') {
-                    reasoning += delta;
-                    if (onDelta) onDelta(delta, true);
-                } else {
-                    content += delta;
-                    if (onDelta) onDelta(delta, false);
-                }
-                deltaChars += delta.length;
-            };
-
-            (async () => {
-                try {
-                    for await (const event of eventStream) {
-                        if (event.type === 'message.part.updated' && event.properties.part?.sessionID === sessionId) {
-                            const { part, delta } = event.properties;
-                            rememberPartType(part);
-                            trackToolActivity(part);
-                            // Older OpenCode servers carried the streaming delta directly on
-                            // message.part.updated; newer servers emit message.part.delta.
-                            if (delta) applyTextDelta(part.type, delta);
-                            continue;
-                        }
-                        if (event.type === 'message.part.delta' && event.properties?.sessionID === sessionId) {
-                            const { partID, delta, field } = event.properties;
-                            // Text and reasoning deltas both stream through field === 'text'.
-                            // Tool-input deltas surface via message.part.updated tool state.
-                            if (typeof delta === 'string' && field === 'text') {
-                                const partType = partTypeById.get(partID);
-                                if (partType === 'reasoning' || partType === 'text') {
-                                    applyTextDelta(partType, delta);
-                                }
-                            }
-                            continue;
-                        }
-                        if (event.type === 'message.updated' &&
-                            event.properties.info?.sessionID === sessionId) {
-                            const info = event.properties.info;
-                            const finish = info.finish;
-                            // An aborted or failed message never produces another delta. Without
-                            // this, the collector waits out the whole first-delta window before
-                            // polling rediscovers the same error.
-                            if (info.error && !finished) {
-                                finished = true;
-                                clearTimeout(timeoutId);
-                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                                if (idleTimer) clearTimeout(idleTimer);
-                                logDebug('SSE upstream message error', {
-                                    sessionId,
-                                    ms: Date.now() - startedAt,
-                                    error: info.error.name || 'UnknownError'
-                                });
-                                resolve({ content, reasoning, error: info.error });
-                                break;
-                            }
-                            // Reconcile active tool calls from the full message snapshot so we
-                            // detect pending tools even when only message.updated fires.
-                            if (Array.isArray(info.parts)) {
-                                for (const part of info.parts) {
-                                    rememberPartType(part);
-                                    if (part && part.type === 'tool') {
-                                        const status = part.state?.status;
-                                        if (status === 'pending' || status === 'running') {
-                                            if (part.id) activeToolCallIds.add(part.id);
-                                        } else if (status === 'completed' || status === 'error') {
-                                            if (part.id) activeToolCallIds.delete(part.id);
-                                        }
-                                    }
-                                }
-                            }
-                            if (finish === 'tool') {
-                                // Assistant turn ended pending a tool call; keep waiting for the result.
-                                if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                                scheduleIdleTimer();
-                                continue;
-                            }
-                            if (finish === 'stop') {
-                                // Only treat the stream as completed when no tool call is still
-                                // pending. OpenCode may emit an intermediate 'stop' snapshot while a
-                                // tool call is in flight; resolving on it would drop the final answer.
-                                if (activeToolCallIds.size > 0) {
-                                    logDebug('Ignoring intermediate stop while tools are active', {
-                                        sessionId,
-                                        activeTools: activeToolCallIds.size
-                                    });
-                                    continue;
-                                }
-                                if (!finished) {
-                                    finished = true;
-                                    clearTimeout(timeoutId);
-                                    if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                                    if (idleTimer) clearTimeout(idleTimer);
-                                    logDebug('SSE completed', {
-                                        sessionId,
-                                        ms: Date.now() - startedAt,
-                                        deltaChars
-                                    });
-                                    resolve({ content, reasoning });
-                                }
-                                break;
-                            }
-                        }
-                    }
-                } catch (e) {
-                    if (!finished) {
-                        finished = true;
-                        clearTimeout(timeoutId);
-                        if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
-                        if (idleTimer) clearTimeout(idleTimer);
-                        reject(e);
-                    }
-                }
-            })();
-        });
-
+        let subscription;
         try {
-            return await finishPromise;
-        } finally {
+            subscription = await client.event.subscribe({ signal: controller.signal });
+            if (!subscription?.stream) return { noData: true };
+        } catch (error) {
+            context?.controller.signal.throwIfAborted();
+            logDebug('Event stream unavailable, using snapshots:', error.message);
+            return { noData: true };
+        }
+        const stream = subscription.stream;
+        let content = '', reasoning = '', finished = false, receivedDelta = false;
+        const partTypes = new Map();
+        const nativeCalls = [];
+        const activeToolCallIds = new Set();
+        let timeout, firstTimer, idleTimer, handoffTimer, onAbort;
+        let settle;
+        const clearTimers = () => { for (const timer of [timeout, firstTimer, idleTimer, handoffTimer]) clearTimeout(timer); };
+        const finish = async (error, result, handoff = false) => {
+            if (finished) return;
+            finished = true;
+            clearTimers();
             controller.abort();
+            if (error || handoff) await abortSession(sessionId);
+            if (error) settle.reject(error);
+            else settle.resolve(result);
+        };
+        const serializeCalls = calls => '<function_calls>' + JSON.stringify(calls.map(call => ({ id: call.sourceId || call.id, name: call.function.name, arguments: JSON.parse(call.function.arguments) }))) + '</function_calls>';
+        const handoff = async () => {
+            const calls = uniqueToolCalls([...callsFromSnapshot(content, reasoning, registry), ...nativeCalls]);
+            if (!calls.length) return false;
+            if (!callsFromSnapshot(content, '', registry).length) {
+                const markup = serializeCalls(calls);
+                content += markup;
+                if (onDelta) onDelta(markup, false);
+            }
+            await finish(null, { content, reasoning, toolCalls: calls }, true);
+            return true;
+        };
+        const scheduleHandoff = () => {
+            if (!registry.length) return;
+            const calls = callsFromSnapshot(content, '', registry);
+            if (!calls.length && !nativeCalls.length) return;
+            clearTimeout(handoffTimer);
+            handoffTimer = setTimeout(() => { handoff().catch(error => finish(error)); }, 250);
+        };
+        const progress = () => {
+            receivedDelta = true;
+            clearTimeout(firstTimer);
+            if (idleTimeoutMs) {
+                clearTimeout(idleTimer);
+                idleTimer = setTimeout(() => {
+                    if (activeToolCallIds.size) progress();
+                    else finish(null, { content, reasoning, idleTimeout: true });
+                }, Math.min(idleTimeoutMs, remainingTime()));
+            }
+        };
+        const trackToolActivity = (part) => {
+            if (part?.type !== 'tool') return;
+            if (['pending', 'running'].includes(part.state?.status)) activeToolCallIds.add(part.id);
+            else activeToolCallIds.delete(part.id);
+            progress();
+        };
+        const delta = (text, isReasoning) => {
+            if (finished || !text) return;
+            progress();
+            if (isReasoning) reasoning += text; else content += text;
+            if (onDelta) onDelta(text, isReasoning);
+            if (!isReasoning) scheduleHandoff();
+        };
+        const completion = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+        onAbort = () => finish(context.controller.signal.reason);
+        context?.controller.signal.addEventListener('abort', onAbort, { once: true });
+        timeout = setTimeout(() => finish(requestError('OpenCode request timed out')), Math.min(timeoutMs, remainingTime()));
+        if (firstDeltaTimeoutMs) firstTimer = setTimeout(() => {
+            if (!receivedDelta) finish(null, { content, reasoning, noData: true });
+        }, Math.min(firstDeltaTimeoutMs, remainingTime()));
+        void (async () => {
+            try {
+                for await (const event of stream) {
+                    if (finished) break;
+                    const props = event.properties || {};
+                    if (event.type === 'permission.asked' && props.sessionID === sessionId) {
+                        if (nativeCalls.length && await handoff()) break;
+                        await finish(requestError('OpenCode requested unanswered permission: ' + props.permission, 502, 'backend_permission_required'));
+                        break;
+                    }
+                    if (event.type === 'message.part.updated' && props.part?.sessionID === sessionId) {
+                        const part = props.part;
+                        partTypes.set(part.id, part.type);
+                        if (part.type === 'tool') {
+                            trackToolActivity(part);
+                            const native = nativeToolCall(part, registry);
+                            if (native) { progress(); clearTimeout(idleTimer); nativeCalls.push(native); }
+                            else if (registry.length && part.state?.status === 'error' && String(part.state.error || '').includes('not a native tool')) {
+                                await finish(requestError('Backend emitted an invalid external tool call without recoverable arguments', 502, 'tool_handoff_failed'));
+                                break;
+                            }
+                        }
+                        if (props.delta) delta(props.delta, part.type === 'reasoning');
+                        continue;
+                    }
+                    if (event.type === 'message.part.delta' && props.sessionID === sessionId && props.field === 'text') {
+                        const type = partTypes.get(props.partID);
+                        if (type === 'text' || type === 'reasoning') delta(props.delta, type === 'reasoning');
+                        continue;
+                    }
+                    if (event.type === 'message.updated' && props.info?.sessionID === sessionId && props.info.role !== 'user') {
+                        const info = props.info;
+                        if (info.error) {
+                            await finish(null, { content, reasoning, error: info.error });
+                            break;
+                        }
+                        for (const part of info.parts || []) trackToolActivity(part);
+                        if (info.finish || info.time?.completed) {
+                            if (await handoff()) break;
+                            if (info.finish === 'tool' || info.finish === 'tool-calls' || activeToolCallIds.size) continue;
+                            await finish(null, { content, reasoning });
+                            break;
+                        }
+                    }
+                }
+                if (!finished) await finish(null, { content, reasoning, noData: !receivedDelta, idleTimeout: receivedDelta });
+            } catch (error) { if (!finished) await finish(error); }
+        })();
+        try { return await completion; }
+        finally {
+            clearTimers();
+            controller.abort();
+            context?.controller.signal.removeEventListener('abort', onAbort);
         }
     }
 
     // Chat completions endpoint
     app.post('/v1/chat/completions', async (req, res) => {
         try {
-            await lock(async () => {
+            await lock(() => runRequest(req, res, async () => {
                 let sessionId = null;
                 // Set inside the try below; the catch must be able to read it to
                 // drop the affinity mapping when a turn fails mid-flight.
@@ -2176,6 +2255,7 @@ export function createApp(config) {
                     const toolMode = requestToolContext.mode;
                     const externalToolContext = requestToolContext.external;
                     const externalToolRegistry = externalToolContext.registry;
+                    requests.getStore().registry = externalToolRegistry;
                     const externalToolChoice = externalToolContext.toolChoice;
                     const internalToolContext = requestToolContext.internal;
             trackToolMode(toolMode, {
@@ -2215,17 +2295,6 @@ export function createApp(config) {
 
                     // Ensure backend is running
                     await ensureBackend(config);
-
-                    // Set active model
-                    try {
-                        await client.config.update({
-                            body: {
-                                activeModel: { providerID: pID, modelID: mID }
-                            }
-                        });
-                    } catch (confError) {
-                        logDebug('Failed to set active model:', confError.message);
-                    }
 
                     // Create session; with the tool-lock plugin its title carries the tool policy
                     const toolControl = await resolveToolControl(toolMode, internalToolContext);
@@ -2267,6 +2336,7 @@ export function createApp(config) {
 
                     if (reuseSessionId) {
                         sessionId = reuseSessionId;
+                        requests.getStore().sessionIds.add(sessionId);
                         logDebug('Chat session resumed', { sessionId });
                     } else {
                         sessionId = await createSession(toolControl);
@@ -2332,8 +2402,6 @@ export function createApp(config) {
                         const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
                         const filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
                         const filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
-                        const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
-                        const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                         let streamedContent = '';
                         let streamedReasoning = '';
                         let rawStreamedContent = '';
@@ -2358,34 +2426,6 @@ export function createApp(config) {
                             if (!delta) return;
                             if (isReasoning) rawStreamedReasoning += delta;
                             else rawStreamedContent += delta;
-                            const parsedDeltaToolCalls = isReasoning
-                                ? parseReasoningToolCalls(delta)
-                                : parseContentToolCalls(delta);
-                            parsedDeltaToolCalls.forEach((toolCall) => {
-                                streamToolCallsSeen = true;
-                                streamedToolCalls.push(toolCall);
-                                res.write(`data: ${JSON.stringify({
-                                    id,
-                                    object: 'chat.completion.chunk',
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: `${pID}/${mID}`,
-                                    choices: [{
-                                        index: 0,
-                                        delta: {
-                                            tool_calls: [{
-                                                index: streamedToolCalls.length - 1,
-                                                id: toolCall.id,
-                                                type: 'function',
-                                                function: {
-                                                    name: toolCall.function.name,
-                                                    arguments: toolCall.function.arguments
-                                                }
-                                            }]
-                                        },
-                                        finish_reason: null
-                                    }]
-                                })}\n\n`);
-                            });
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
                             if (isReasoning) {
@@ -2438,16 +2478,8 @@ export function createApp(config) {
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
                             }
                             try {
-                                const collectPromise = collectFromEvents(
-                                    sessionId,
-                                    REQUEST_TIMEOUT_MS,
-                                    sendDelta,
-                                    EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                    EVENT_IDLE_TIMEOUT_MS
-                                );
-                                const safeCollect = collectPromise.catch((err) => ({ __error: err }));
-                                client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
-                                collected = await safeCollect;
+                                collected = await collectPrompt(promptParams, sendDelta);
+                                sessionId = promptParams.path.id;
                             } catch (e) {
                                 logDebug('Stream error:', e.message);
                             }
@@ -2468,32 +2500,22 @@ export function createApp(config) {
                             break;
                         }
 
-                        if (collected && collected.__error) {
-                            logDebug('SSE collect error, falling back to polling', {
-                                sessionId,
-                                error: collected.__error?.message
-                            });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
-                            } else {
-                                if (reasoning) sendDelta(reasoning, true);
-                                if (content) sendDelta(content, false);
-                            }
-                        } else if (collected && collected.noData) {
+                        if (collected?.__error) throw collected.__error;
+                        if (collected?.error) throw requestError([collected.error.name, collected.error.data?.message || collected.error.message].filter(Boolean).join(': '), 502, 'upstream_error');
+                        if (collected && collected.noData) {
                             logDebug('Fallback to polling (stream)', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, remainingTime());
+                            if (error) {
+                                throw requestError([error.name, error.data?.message || error.message].filter(Boolean).join(': '), 502, 'upstream_error');
                             } else {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
                         } else if (collected && collected.idleTimeout) {
                             logDebug('SSE idle timeout, polling for completion', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, remainingTime());
+                            if (error) {
+                                throw requestError([error.name, error.data?.message || error.message].filter(Boolean).join(': '), 502, 'upstream_error');
                             } else {
                                 const remainingReasoning = reasoning && reasoning.startsWith(rawStreamedReasoning)
                                     ? reasoning.slice(rawStreamedReasoning.length)
@@ -2511,11 +2533,11 @@ export function createApp(config) {
                             if (collected.content) sendDelta(collected.content, false);
                         }
 
-                        if (!streamedContent && !streamedReasoning) {
+                        if (!streamedContent && !streamedReasoning && !collected?.toolCalls?.length) {
                             logDebug('SSE returned empty, falling back to polling', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, remainingTime());
+                            if (error) {
+                                throw requestError([error.name, error.data?.message || error.message].filter(Boolean).join(': '), 502, 'upstream_error');
                             } else {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
@@ -2526,7 +2548,8 @@ export function createApp(config) {
                             // (issue #9). The message snapshot separates the two correctly, so
                             // recover the missing answer from it instead of returning empty content.
                             logDebug('Reasoning streamed but no content, reconciling from snapshot', { sessionId });
-                            const snapshot = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS).catch(() => null);
+                            const snapshot = collected?.toolCalls?.length ? null : await pollForAssistantResponse(sessionId, remainingTime());
+                            if (snapshot?.error) throw requestError(snapshot.error.data?.message || snapshot.error.message || snapshot.error.name, 502, 'upstream_error');
                             if (snapshot && snapshot.content) {
                                 const remainingContent = rawStreamedContent
                                     ? snapshot.content.slice(rawStreamedContent.length)
@@ -2536,31 +2559,12 @@ export function createApp(config) {
                         }
 
                         // Flush held buffers from the stream parsers and filters before final batch parse.
-                        const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
-                        const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
                         const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
                         const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
                         const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
                         const finalContentText = rawStreamedContent + flushedContentText;
 
-                        // Parse each channel, then retry on the two joined. Models sometimes open a
-                        // block in reasoning and close it in content, leaving neither channel with a
-                        // complete block. The joined retry only runs when nothing was found, so a
-                        // block contained in one channel is never counted twice.
-                        const parseStreamedToolCalls = () => {
-                            if (externalToolRegistry.length === 0) return [];
-                            const perChannel = [
-                                ...flushedReasoningCalls,
-                                ...flushedContentCalls,
-                                ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
-                            ];
-                            if (perChannel.length > 0) return perChannel;
-                            return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
-                        };
-
-                        let parsedToolCalls = streamedToolCalls.length > 0
-                            ? streamedToolCalls
-                            : parseStreamedToolCalls();
+                        let parsedToolCalls = collected?.toolCalls?.length ? collected.toolCalls : callsFromSnapshot(finalContentText, finalReasoningText, externalToolRegistry);
                         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                             const forcedResponse = await requestForcedChatToolCall();
                             if (forcedResponse) {
@@ -2573,6 +2577,7 @@ export function createApp(config) {
                         }
                         const { validCalls: validatedStreamedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
                         const finalStreamedToolCalls = validatedStreamedToolCalls;
+                        streamToolCallsSeen = finalStreamedToolCalls.length > 0;
                         if (finalStreamedToolCalls.length > 0 && streamedToolCalls.length === 0) {
                             const toolCallDeltas = finalStreamedToolCalls.map((toolCall, index) => ({
                                 index,
@@ -2646,12 +2651,13 @@ export function createApp(config) {
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
                             }
                             const attemptStart = Date.now();
-                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            const promptResult = await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            sessionId = promptParams.path.id;
                             logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
-                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const collected = extractFromParts(promptResult.data.parts);
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
-                            error = collected.error || null;
+                            error = promptResult.data.error || null;
                             // Bounded retry for upstream throttling mislabeled as billing
                             // errors (401 CreditsError etc.); only when nothing usable was
                             // produced, so real failures still surface after RETRY_MAX_ATTEMPTS.
@@ -2667,7 +2673,7 @@ export function createApp(config) {
                             }
                             break;
                         }
-                        if (error && !content && !reasoning) {
+                        if (error) {
                             if (affinitySignal) await chatSessionEntryFail(affinitySignal, sessionId);
                             return res.status(502).json({
                                 error: {
@@ -2677,14 +2683,14 @@ export function createApp(config) {
                             });
                         }
                         let parsedToolCalls = externalToolRegistry.length > 0
-                            ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                            ? callsFromSnapshot(content, reasoning, externalToolRegistry)
                             : [];
                         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                             const forcedResponse = await requestForcedChatToolCall();
                             if (forcedResponse) {
                                 content = forcedResponse.content || content;
                                 reasoning = forcedResponse.reasoning || reasoning;
-                                parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                                parsedToolCalls = callsFromSnapshot(content, reasoning, externalToolRegistry);
                             }
                         }
                         const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
@@ -2743,6 +2749,7 @@ export function createApp(config) {
                         });
                     }
                 } catch (error) {
+                    if (sessionId) await abortSession(sessionId);
                     console.error('[Proxy] API Error:', error.message);
                     console.error('[Proxy] Error details:', error);
 
@@ -2751,7 +2758,7 @@ export function createApp(config) {
                     if (!res.headersSent) {
                         const transformed = transformUpstreamError(error);
                         res.status(transformed.statusCode).json(transformed.error);
-                    } else if (!res.destroyed) {
+                    } else if (!res.destroyed && !res.writableEnded) {
                         res.write(`data: ${JSON.stringify({ error: { message: error.message } })}\n\n`);
                         res.end();
                     }
@@ -2772,7 +2779,7 @@ export function createApp(config) {
                         eventStream.close();
                     }
                 }
-            }, REQUEST_TIMEOUT_MS + 20000);
+            }), REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {
             console.error('[Proxy] Request Handler Error:', error.message);
             if (!res.headersSent) {
@@ -2807,7 +2814,7 @@ export function createApp(config) {
     // Anthropic Messages API endpoint
     app.post('/v1/messages', async (req, res) => {
         try {
-            await lock(async () => {
+            await lock(() => runRequest(req, res, async () => {
                 let sessionId = null;
                 let id = `msg_${crypto.randomUUID()}`;
                 let keepaliveInterval = null;
@@ -3012,6 +3019,7 @@ export function createApp(config) {
                     const toolMode = requestToolContext.mode;
                     const externalToolContext = requestToolContext.external;
                     const externalToolRegistry = externalToolContext.registry;
+                    requests.getStore().registry = externalToolRegistry;
                     const externalToolChoice = externalToolContext.toolChoice;
                     const internalToolContext = requestToolContext.internal;
                     trackToolMode(toolMode, {
@@ -3043,13 +3051,6 @@ export function createApp(config) {
                     });
 
                     await ensureBackend(config);
-                    try {
-                        await client.config.update({
-                            body: { activeModel: { providerID: pID, modelID: mID } }
-                        });
-                    } catch (confError) {
-                        logDebug('Failed to set active model:', confError.message);
-                    }
 
                     const toolControl = await resolveToolControl(toolMode, internalToolContext);
                     sessionId = await createSession(toolControl);
@@ -3103,8 +3104,6 @@ export function createApp(config) {
                             forceStrip: shouldStripStreamingToolMarkup,
                             registry: externalToolRegistry
                         });
-                        const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
-                        const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                         let streamedContent = '';
                         let streamedReasoning = '';
                         let rawStreamedContent = '';
@@ -3115,7 +3114,7 @@ export function createApp(config) {
                         const promptTokens = Math.ceil((fullPromptText || '').length / 4);
 
                         const writeEvent = (event) => {
-                            if (!res.destroyed) {
+                            if (!res.destroyed && !res.writableEnded) {
                                 res.write(`data: ${JSON.stringify(event)}\n\n`);
                             }
                         };
@@ -3186,10 +3185,6 @@ export function createApp(config) {
                             if (!delta) return;
                             if (isReasoning) rawStreamedReasoning += delta;
                             else rawStreamedContent += delta;
-                            const parsedDeltaToolCalls = isReasoning
-                                ? parseReasoningToolCalls(delta)
-                                : parseContentToolCalls(delta);
-                            parsedDeltaToolCalls.forEach((toolCall) => streamedToolCalls.push(toolCall));
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
                             if (isReasoning) {
@@ -3225,16 +3220,8 @@ export function createApp(config) {
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
                             }
                             try {
-                                const collectPromise = collectFromEvents(
-                                    sessionId,
-                                    REQUEST_TIMEOUT_MS,
-                                    sendDelta,
-                                    EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                    EVENT_IDLE_TIMEOUT_MS
-                                );
-                                const safeCollect = collectPromise.catch((err) => ({ __error: err }));
-                                client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
-                                collected = await safeCollect;
+                                collected = await collectPrompt(promptParams, sendDelta);
+                                sessionId = promptParams.path.id;
                             } catch (e) {
                                 logDebug('Anthropic stream error:', e.message);
                             }
@@ -3255,12 +3242,11 @@ export function createApp(config) {
                             break;
                         }
 
+                        if (collected?.__error) throw collected.__error;
+                        if (collected?.error) throw requestError([collected.error.name, collected.error.data?.message || collected.error.message].filter(Boolean).join(': '), 502, 'upstream_error');
                         const pollFallback = async (mode) => {
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                            if (error && !content && !reasoning) {
-                                logDebug('Anthropic stream fallback error', { error: error.message });
-                                return;
-                            }
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, remainingTime());
+                            if (error) throw requestError([error.name, error.data?.message || error.message].filter(Boolean).join(': '), 502, 'upstream_error');
                             if (mode === 'idleTimeout') {
                                 // Same guard as chat completions: the SSE pipe may have
                                 // delivered a prefix before going idle, so only the
@@ -3291,12 +3277,13 @@ export function createApp(config) {
                             if (collected.reasoning) sendDelta(collected.reasoning, true);
                             if (collected.content) sendDelta(collected.content, false);
                         }
-                        if (!didFullPoll && !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0) {
+                        if (!didFullPoll && !rawStreamedContent && !rawStreamedReasoning && !collected?.toolCalls?.length) {
                             logDebug('Anthropic SSE returned empty, falling back to polling', { sessionId });
                             await pollFallback('full');
-                        } else if (rawStreamedReasoning && !rawStreamedContent && streamedToolCalls.length === 0) {
+                        } else if (rawStreamedReasoning && !rawStreamedContent && !collected?.toolCalls?.length) {
                             logDebug('Anthropic reasoning streamed without content, reconciling from snapshot', { sessionId });
-                            const snapshot = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS).catch(() => null);
+                            const snapshot = await pollForAssistantResponse(sessionId, remainingTime());
+                            if (snapshot?.error) throw requestError(snapshot.error.data?.message || snapshot.error.message || snapshot.error.name, 502, 'upstream_error');
                             if (snapshot && snapshot.content) {
                                 const remainingContent = rawStreamedContent
                                     ? snapshot.content.slice(rawStreamedContent.length)
@@ -3304,9 +3291,6 @@ export function createApp(config) {
                                 if (remainingContent) sendDelta(remainingContent, false);
                             }
                         }
-
-                        const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
-                        const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
                         const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
                         const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
                         if (flushedReasoningText) {
@@ -3324,16 +3308,7 @@ export function createApp(config) {
                         const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
                         const finalContentText = rawStreamedContent + flushedContentText;
 
-                        let parsedToolCalls = streamedToolCalls.length > 0
-                            ? streamedToolCalls
-                            : [
-                                ...flushedReasoningCalls,
-                                ...flushedContentCalls,
-                                ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
-                            ];
-                        if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0) {
-                            parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
-                        }
+                        let parsedToolCalls = collected?.toolCalls?.length ? collected.toolCalls : callsFromSnapshot(finalContentText, finalReasoningText, externalToolRegistry);
                         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                             const forcedResponse = await requestForcedAnthropicToolCall();
                             if (forcedResponse) {
@@ -3425,11 +3400,12 @@ export function createApp(config) {
                                 requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
                             }
-                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
-                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const promptResult = await promptWithTimeout(promptParams, remainingTime());
+                            sessionId = promptParams.path.id;
+                            const collected = extractFromParts(promptResult.data.parts);
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
-                            error = collected.error || null;
+                            error = promptResult.data.error || null;
                             if (
                                 error
                                 && !content
@@ -3442,20 +3418,20 @@ export function createApp(config) {
                             }
                             break;
                         }
-                        if (error && !content && !reasoning) {
+                        if (error) {
                             // 5xx keeps a normalized Anthropic type: upstream error
                             // names (Error/OpenCodeError/...) are not valid types.
                             return anthropicError(502, 'api_error', error.data?.message || error.message || 'OpenCode provider error');
                         }
                         let parsedToolCalls = externalToolRegistry.length > 0
-                            ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                            ? callsFromSnapshot(content, reasoning, externalToolRegistry)
                             : [];
                         if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                             const forcedResponse = await requestForcedAnthropicToolCall();
                             if (forcedResponse) {
                                 content = forcedResponse.content || content;
                                 reasoning = forcedResponse.reasoning || reasoning;
-                                parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                                parsedToolCalls = callsFromSnapshot(content, reasoning, externalToolRegistry);
                             }
                         }
                         const { validCalls: rawValidatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
@@ -3504,6 +3480,7 @@ export function createApp(config) {
                         });
                     }
                 } catch (error) {
+                    if (sessionId) await abortSession(sessionId);
                     console.error('[Proxy] Anthropic API Error:', error.message);
                     if (keepaliveInterval) clearInterval(keepaliveInterval);
 
@@ -3529,8 +3506,8 @@ export function createApp(config) {
                             }
                         });
                     }
-                    if (!res.destroyed) {
-                        res.write(`data: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: error.message } })}\n\n`);
+                    if (!res.destroyed && !res.writableEnded) {
+                        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: error.message } })}\n\n`);
                         res.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
                         res.end();
                     }
@@ -3544,7 +3521,7 @@ export function createApp(config) {
                 } finally {
                     if (typeof keepaliveInterval !== 'undefined' && keepaliveInterval) clearInterval(keepaliveInterval);
                 }
-            }, REQUEST_TIMEOUT_MS + 20000);
+            }), REQUEST_TIMEOUT_MS + 20000);
         } catch (error) {
             console.error('[Proxy] Anthropic Request Handler Error:', error.message);
             if (!res.headersSent) {
@@ -3823,6 +3800,8 @@ export function createApp(config) {
 
     app.post('/v1/responses', async (req, res) => {
         try {
+            await runRequest(req, res, async () => {
+        try {
             const {
                 model,
                 input,
@@ -3887,6 +3866,7 @@ export function createApp(config) {
             });
             const externalToolContext = requestToolContext.external;
             const externalToolRegistry = externalToolContext.registry;
+            requests.getStore().registry = externalToolRegistry;
             const externalToolChoice = externalToolContext.toolChoice;
             const assistantToolCalls = new Map();
 
@@ -4001,18 +3981,13 @@ export function createApp(config) {
 
             await ensureBackend(config);
 
-            try {
-                await client.config.update({
-                    body: { activeModel: { providerID: pID, modelID: mID } }
-                });
-            } catch (e) { }
-
             // Continue the stored session when chaining from previous_response_id;
             // otherwise start a fresh one.
             // With the tool-lock plugin, a chained session keeps the policy it was
             // created with, so toolControl.title only matters for new sessions.
             const toolControl = await resolveToolControl(toolMode, internalToolContext);
             let sessionId = previousState?.sessionId || null;
+            if (sessionId) requests.getStore().sessionIds.add(sessionId);
             if (!sessionId) {
                 sessionId = await createSession(toolControl);
             }
@@ -4120,14 +4095,12 @@ export function createApp(config) {
                 emit({
                     type: 'response.created',
                     sequence_number: nextSeq(),
-                    response: { id: responseId, object: 'response', created: Math.floor(Date.now() / 1000), model: `${pID}/${mID}` }
+                    response: { id: responseId, object: 'response', status: 'in_progress', created_at: Math.floor(Date.now() / 1000), created: Math.floor(Date.now() / 1000), model: `${pID}/${mID}` }
                 });
 
                 const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
                 const filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
                 const filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
-                const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
-                const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                 const streamedToolCalls = [];
                 let rawContent = '';
                 let rawReasoning = '';
@@ -4213,13 +4186,6 @@ export function createApp(config) {
                     if (!delta) return;
                     if (isReasoning) rawReasoning += delta;
                     else rawContent += delta;
-                    const parsedDeltaToolCalls = isReasoning
-                        ? parseReasoningToolCalls(delta)
-                        : parseContentToolCalls(delta);
-                    if (parsedDeltaToolCalls.length > 0) {
-                        const { validCalls: allowedDeltaToolCalls } = finalizeValidatedToolCalls(parsedDeltaToolCalls, externalToolRegistry);
-                        allowedDeltaToolCalls.forEach((toolCall) => emitResponsesFunctionCall(toolCall));
-                    }
                     const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                     if (!filtered) return;
                     if (isReasoning) {
@@ -4253,27 +4219,22 @@ export function createApp(config) {
 
                 let collected = null;
                 try {
-                    const collectPromise = collectFromEvents(
-                        sessionId,
-                        REQUEST_TIMEOUT_MS,
-                        sendResponsesDelta,
-                        EVENT_FIRST_DELTA_TIMEOUT_MS,
-                        EVENT_IDLE_TIMEOUT_MS
-                    );
-                    const safeCollect = collectPromise.catch((err) => ({ __error: err }));
-                    client.session.prompt(promptParams).catch(err => logDebug('Responses prompt error:', err.message));
-                    collected = await safeCollect;
+                    collected = await collectPrompt(promptParams, sendResponsesDelta);
+                    sessionId = promptParams.path.id;
                 } catch (e) {
                     collected = { __error: e };
                 }
 
-                if (!content && !reasoning) {
-                    const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                    if (polled.error && !polled.content && !polled.reasoning) throw polled.error;
+                if (collected?.__error) throw collected.__error;
+                if (collected?.error) throw requestError([collected.error.name, collected.error.data?.message || collected.error.message].filter(Boolean).join(': '), 502, 'upstream_error');
+                if (!content && !reasoning && !collected?.toolCalls?.length) {
+                    const polled = await pollForAssistantResponse(sessionId, remainingTime());
+                    if (polled.error) throw requestError(polled.error.data?.message || polled.error.message || polled.error.name, 502, 'upstream_error');
                     if (polled.reasoning) sendResponsesDelta(polled.reasoning, true);
                     if (polled.content) sendResponsesDelta(polled.content, false);
                 } else if (collected && collected.idleTimeout) {
-                    const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                    const polled = await pollForAssistantResponse(sessionId, remainingTime());
+                    if (polled.error) throw requestError(polled.error.data?.message || polled.error.message || polled.error.name, 502, 'upstream_error');
                     const remainingReasoning = polled.reasoning && polled.reasoning.startsWith(rawReasoning)
                         ? polled.reasoning.slice(rawReasoning.length)
                         : polled.reasoning;
@@ -4343,36 +4304,19 @@ export function createApp(config) {
                 }
 
                 let polledForToolCalls = null;
-                if (externalToolRegistry.length > 0 && streamedToolCalls.length === 0) {
+                if (externalToolRegistry.length > 0 && streamedToolCalls.length === 0 && !collected?.toolCalls?.length) {
                     try {
-                        polledForToolCalls = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                        polledForToolCalls = await pollForAssistantResponse(sessionId, remainingTime());
                     } catch (e) { }
                 }
 
                 // Flush held buffers from the stream parsers and filters before final batch parse.
-                const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
-                const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
                 const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
                 const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
                 const finalReasoningText = (polledForToolCalls?.reasoning || rawReasoning) + flushedReasoningText;
                 const finalContentText = (polledForToolCalls?.content || rawContent) + flushedContentText;
 
-                // Parse each channel, then retry on the two joined. See the matching comment
-                // in /v1/chat/completions for why the joined retry is gated on finding nothing.
-                const parseStreamedToolCalls = () => {
-                    if (externalToolRegistry.length === 0) return [];
-                    const perChannel = [
-                        ...flushedReasoningCalls,
-                        ...flushedContentCalls,
-                        ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
-                    ];
-                    if (perChannel.length > 0) return perChannel;
-                    return parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
-                };
-
-                let parsedToolCalls = streamedToolCalls.length > 0
-                    ? streamedToolCalls
-                    : parseStreamedToolCalls();
+                let parsedToolCalls = collected?.toolCalls?.length ? collected.toolCalls : callsFromSnapshot(finalContentText, finalReasoningText, externalToolRegistry);
                 if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                     const forcedResponse = await requestForcedResponsesToolCall();
                     if (forcedResponse) {
@@ -4404,6 +4348,8 @@ export function createApp(config) {
                 const response = {
                     id: responseId,
                     object: 'response',
+                    status: 'completed',
+                    created_at: Math.floor(Date.now() / 1000),
                     created: Math.floor(Date.now() / 1000),
                     model: `${pID}/${mID}`,
                     reasoning: safeReasoning ? { effort: reasoningLevel, summary: safeReasoning.substring(0, 100) } : undefined,
@@ -4422,12 +4368,14 @@ export function createApp(config) {
                 return res.end();
             }
 
-            const responseRes = await client.session.prompt(promptParams);
+            const responseRes = await promptWithTimeout(promptParams, remainingTime());
+            sessionId = promptParams.path.id;
+            if (responseRes.data.error) throw requestError(responseRes.data.error.data?.message || responseRes.data.error.message || responseRes.data.error.name, 502, 'upstream_error');
             const responseParts = responseRes.data?.parts || [];
             const promptContent = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
             const promptReasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
             const promptParsedToolCalls = externalToolRegistry.length > 0
-                ? parseExternalToolCallsFromText(externalToolRegistry, promptReasoning, promptContent)
+                ? callsFromSnapshot(promptContent, promptReasoning, externalToolRegistry)
                 : [];
 
             content = promptParsedToolCalls.length > 0 ? '' : promptContent;
@@ -4436,14 +4384,14 @@ export function createApp(config) {
             let promptBasedToolCalls = promptParsedToolCalls;
             const shouldPollForResponses = !promptContent && !promptReasoning;
             if (shouldPollForResponses) {
-                const polledResponse = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
-                if (polledResponse.error && !polledResponse.content && !polledResponse.reasoning) {
+                const polledResponse = await pollForAssistantResponse(sessionId, remainingTime());
+                if (polledResponse.error) {
                     throw polledResponse.error;
                 }
                 content = polledResponse.content || content;
                 reasoning = polledResponse.reasoning || reasoning;
                 promptBasedToolCalls = externalToolRegistry.length > 0
-                    ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                    ? callsFromSnapshot(content, reasoning, externalToolRegistry)
                     : [];
             }
 
@@ -4455,14 +4403,14 @@ export function createApp(config) {
             let parsedToolCalls = promptBasedToolCalls.length > 0
                 ? promptBasedToolCalls
                 : (externalToolRegistry.length > 0
-                    ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                    ? callsFromSnapshot(content, reasoning, externalToolRegistry)
                     : []);
             if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
                 const forcedResponse = await requestForcedResponsesToolCall();
                 if (forcedResponse) {
                     content = forcedResponse.content || content;
                     reasoning = forcedResponse.reasoning || reasoning;
-                    parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                    parsedToolCalls = callsFromSnapshot(content, reasoning, externalToolRegistry);
                 }
             }
             const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
@@ -4484,6 +4432,8 @@ export function createApp(config) {
             const response = {
                 id: responseId,
                 object: 'response',
+                status: 'completed',
+                created_at: Math.floor(Date.now() / 1000),
                 created: Math.floor(Date.now() / 1000),
                 model: `${pID}/${mID}`,
                 reasoning: safeReasoning ? { effort: reasoningLevel, summary: safeReasoning.substring(0, 100) } : undefined,
@@ -4501,12 +4451,14 @@ export function createApp(config) {
 
             return res.json(response);
         } catch (error) {
+            for (const sessionId of requests.getStore()?.sessionIds || []) await abortSession(sessionId);
             console.error('[Proxy] Responses API Error:', error?.message || error?.data?.message || error?.name || error);
             const transformed = transformUpstreamError(error);
             // Once the SSE headers are out, res.json() throws ERR_HTTP_HEADERS_SENT. That throw
             // escapes this async handler as an unhandled rejection, which terminates the whole
             // process under Node's default --unhandled-rejections=throw. Report the failure on
             // the already-open stream instead.
+            if (res.writableEnded || res.destroyed) return;
             if (res.headersSent) {
                 try {
                     res.write(`data: ${JSON.stringify({
@@ -4520,6 +4472,10 @@ export function createApp(config) {
                 return res.end();
             }
             return res.status(transformed.statusCode).json(transformed.error);
+        }
+            });
+        } catch (error) {
+            if (!res.headersSent && !res.writableEnded) res.status(error.statusCode || 500).json({ error: { message: error.message } });
         }
     });
 

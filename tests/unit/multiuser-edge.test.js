@@ -8,6 +8,7 @@ const sdkMocks = {
     sessionPrompt: jest.fn(),
     sessionMessages: jest.fn(),
     sessionDelete: jest.fn(),
+    sessionAbort: jest.fn(async () => ({ data: true })),
     eventSubscribe: jest.fn()
 };
 
@@ -37,7 +38,7 @@ jest.unstable_mockModule('http', () => ({
 jest.unstable_mockModule('@opencode-ai/sdk', () => ({
     createOpencodeClient: jest.fn(() => ({
         config: { providers: sdkMocks.configProviders, update: sdkMocks.configUpdate },
-        session: { create: sdkMocks.sessionCreate, prompt: sdkMocks.sessionPrompt, messages: sdkMocks.sessionMessages, delete: sdkMocks.sessionDelete },
+        session: { create: sdkMocks.sessionCreate, prompt: sdkMocks.sessionPrompt, messages: sdkMocks.sessionMessages, delete: sdkMocks.sessionDelete, abort: sdkMocks.sessionAbort },
         event: { subscribe: sdkMocks.eventSubscribe }
     }))
 }));
