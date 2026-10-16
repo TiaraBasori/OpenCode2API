@@ -441,6 +441,7 @@ describe('Proxy Anthropic Messages API', () => {
             'content_block_stop',
             'content_block_start',
             'content_block_delta',
+            'content_block_delta',
             'content_block_stop',
             'message_delta',
             'message_stop'
@@ -638,6 +639,79 @@ describe('Proxy Anthropic Messages API', () => {
             name: 'custom_tool',
             content: 'Tool execution error',
             is_error: true
+        });
+    });
+
+    test('POST /v1/messages forces a required tool call when tool_choice is any/tool and strips foreign tag markup', async () => {
+        sdkMocks.sessionMessages
+            .mockResolvedValueOnce([
+                {
+                    info: { role: 'assistant', finish: 'stop' },
+                    parts: [{ type: 'text', text: 'I forgot to call the tool.' }]
+                }
+            ])
+            .mockResolvedValueOnce([
+                {
+                    info: { role: 'assistant', finish: 'stop' },
+                    parts: [{
+                        type: 'text',
+                        text: '<weather_lookup>{"city":"Paris"}</weather_lookup>'
+                    }]
+                }
+            ]);
+
+        const res = await request(app)
+            .post('/v1/messages')
+            .set('x-api-key', 'test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                max_tokens: 128,
+                tool_choice: { type: 'any' },
+                tools: [WEATHER_TOOL],
+                messages: [{ role: 'user', content: 'Weather in Paris?' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.stop_reason).toEqual('tool_use');
+        expect(res.body.content).toEqual([{
+            type: 'tool_use',
+            id: expect.stringMatching(/^call_/),
+            name: 'weather_lookup',
+            input: { city: 'Paris' }
+        }]);
+        expect(sdkMocks.sessionPrompt).toHaveBeenCalledTimes(2);
+    });
+
+    test('POST /v1/messages honors disable_parallel_tool_use on tool_choice', async () => {
+        sdkMocks.sessionMessages.mockResolvedValueOnce([
+            {
+                info: { role: 'assistant', finish: 'stop' },
+                parts: [{
+                    type: 'text',
+                    text: '<function_calls>[{"id":"call_1","name":"weather_lookup","arguments":{"city":"Tokyo"}},{"id":"call_2","name":"weather_lookup","arguments":{"city":"Osaka"}}]</function_calls>'
+                }]
+            }
+        ]);
+
+        const res = await request(app)
+            .post('/v1/messages')
+            .set('x-api-key', 'test-key')
+            .send({
+                model: 'opencode/kimi-k2.5',
+                max_tokens: 128,
+                tool_choice: { type: 'auto', disable_parallel_tool_use: true },
+                tools: [WEATHER_TOOL],
+                messages: [{ role: 'user', content: 'Weather in Tokyo and Osaka?' }]
+            });
+
+        expect(res.statusCode).toEqual(200);
+        expect(res.body.stop_reason).toEqual('tool_use');
+        expect(res.body.content).toHaveLength(1);
+        expect(res.body.content[0]).toEqual({
+            type: 'tool_use',
+            id: 'call_1',
+            name: 'weather_lookup',
+            input: { city: 'Tokyo' }
         });
     });
 

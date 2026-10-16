@@ -587,11 +587,29 @@ export function createApp(config) {
     app.use((req, res, next) => {
         if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
         if (API_KEY && API_KEY.trim() !== '') {
+            const expectedKey = API_KEY.trim();
+            const safeEquals = (candidate) => {
+                if (typeof candidate !== 'string' || !candidate) return false;
+                const bufA = Buffer.from(candidate);
+                const bufB = Buffer.from(expectedKey);
+                if (bufA.length !== bufB.length) {
+                    const hashA = crypto.createHash('sha256').update(bufA).digest();
+                    const hashB = crypto.createHash('sha256').update(bufB).digest();
+                    crypto.timingSafeEqual(hashA, hashB);
+                    return false;
+                }
+                return crypto.timingSafeEqual(bufA, bufB);
+            };
             const authHeader = req.headers.authorization;
+            const bearerToken = (typeof authHeader === 'string' && authHeader.startsWith('Bearer '))
+                ? authHeader.slice('Bearer '.length).trim()
+                : '';
+            const bearerOk = safeEquals(bearerToken);
             // Anthropic Messages clients authenticate via x-api-key; scope it to
             // /v1/messages so the OpenAI-compatible endpoints stay Bearer-only.
-            const anthropicApiKeyOk = req.path === '/v1/messages' && req.headers['x-api-key'] === API_KEY;
-            if ((!authHeader || authHeader !== `Bearer ${API_KEY}`) && !anthropicApiKeyOk) {
+            const xApiKey = typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'].trim() : '';
+            const anthropicApiKeyOk = req.path === '/v1/messages' && safeEquals(xApiKey);
+            if (!bearerOk && !anthropicApiKeyOk) {
                 if (req.path === '/v1/messages') {
                     return res.status(401).json({
                         type: 'error',
@@ -2480,12 +2498,15 @@ export function createApp(config) {
 
                     // Anthropic tool_choice -> OpenAI tool_choice
                     const rawToolChoice = body.tool_choice;
+                    const disableParallelToolUse = Boolean(rawToolChoice && typeof rawToolChoice === 'object' && rawToolChoice.disable_parallel_tool_use === true);
                     let toolChoice;
                     if (rawToolChoice && typeof rawToolChoice === 'object') {
                         if (rawToolChoice.type === 'auto') toolChoice = 'auto';
                         else if (rawToolChoice.type === 'any') toolChoice = 'required';
                         else if (rawToolChoice.type === 'tool' && rawToolChoice.name) {
                             toolChoice = { type: 'function', function: { name: rawToolChoice.name } };
+                        } else if (rawToolChoice.type === 'none') {
+                            toolChoice = 'none';
                         }
                     } else if (rawToolChoice === 'auto' || rawToolChoice === 'required' || rawToolChoice === 'none') {
                         toolChoice = rawToolChoice;
@@ -2681,9 +2702,7 @@ export function createApp(config) {
                         body: {
                             model: { providerID: pID, modelID: mID },
                             system: systemWithGuard,
-                            parts: externalToolContext.reminder
-                                ? [...parts, { type: 'text', text: externalToolContext.reminder }]
-                                : parts,
+                            parts,
                             ...(requestParams.max_tokens && { max_tokens: requestParams.max_tokens }),
                             ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
                             ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
@@ -2695,6 +2714,19 @@ export function createApp(config) {
                         promptParams.body.tools = toolOverrides;
                     }
 
+                    const makeForcedAnthropicToolCallRequester = () => createForcedToolCallRequester({
+                        mode: externalToolChoice.mode,
+                        sessionId,
+                        systemWithGuard,
+                        requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
+                        providerID: pID,
+                        modelID: mID,
+                        toolOverrides,
+                        requestTimeoutMs: REQUEST_TIMEOUT_MS,
+                        forbidThinkBlock: true
+                    });
+                    let requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
+
                     res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
                     res.setHeader('Cache-Control', 'no-cache');
                     res.setHeader('Connection', 'keep-alive');
@@ -2703,8 +2735,16 @@ export function createApp(config) {
 
                     if (stream) {
                         const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
-                        const filterContentDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
-                        const filterReasoningDelta = createToolCallFilter({ disableTools: DISABLE_TOOLS, forceStrip: shouldStripStreamingToolMarkup });
+                        const filterContentDelta = createToolCallFilter({
+                            disableTools: DISABLE_TOOLS,
+                            forceStrip: shouldStripStreamingToolMarkup,
+                            registry: externalToolRegistry
+                        });
+                        const filterReasoningDelta = createToolCallFilter({
+                            disableTools: DISABLE_TOOLS,
+                            forceStrip: shouldStripStreamingToolMarkup,
+                            registry: externalToolRegistry
+                        });
                         const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                         const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
                         let streamedContent = '';
@@ -2714,6 +2754,69 @@ export function createApp(config) {
                         const streamedToolCalls = [];
                         let completionTokens = 0;
                         let reasoningTokens = 0;
+                        const promptTokens = Math.ceil((fullPromptText || '').length / 4);
+
+                        const writeEvent = (event) => {
+                            if (!res.destroyed) {
+                                res.write(`data: ${JSON.stringify(event)}\n\n`);
+                            }
+                        };
+
+                        let messageStarted = false;
+                        let blockIndex = 0;
+                        let openBlock = null;
+
+                        const ensureMessageStart = () => {
+                            if (messageStarted) return;
+                            messageStarted = true;
+                            writeEvent({
+                                type: 'message_start',
+                                message: {
+                                    id,
+                                    type: 'message',
+                                    role: 'assistant',
+                                    model: `${pID}/${mID}`,
+                                    content: [],
+                                    stop_sequence: null,
+                                    stop_reason: null,
+                                    usage: { input_tokens: promptTokens, output_tokens: 0 }
+                                }
+                            });
+                        };
+
+                        const closeOpenBlock = () => {
+                            if (!openBlock) return;
+                            writeEvent({ type: 'content_block_stop', index: openBlock.index });
+                            openBlock = null;
+                        };
+
+                        const emitStreamDelta = (text, isReasoning = false) => {
+                            if (!text) return;
+                            ensureMessageStart();
+                            const targetType = isReasoning ? 'thinking' : 'text';
+                            if (openBlock && openBlock.type !== targetType) {
+                                closeOpenBlock();
+                            }
+                            if (!openBlock) {
+                                const idx = blockIndex;
+                                blockIndex += 1;
+                                openBlock = { type: targetType, index: idx };
+                                writeEvent({
+                                    type: 'content_block_start',
+                                    index: idx,
+                                    content_block: targetType === 'thinking'
+                                        ? { type: 'thinking', thinking: '' }
+                                        : { type: 'text', text: '' }
+                                });
+                            }
+                            writeEvent({
+                                type: 'content_block_delta',
+                                index: openBlock.index,
+                                delta: targetType === 'thinking'
+                                    ? { type: 'thinking_delta', thinking: text }
+                                    : { type: 'text_delta', text }
+                            });
+                        };
 
                         keepaliveInterval = setInterval(() => {
                             if (!res.destroyed) {
@@ -2734,9 +2837,11 @@ export function createApp(config) {
                             if (isReasoning) {
                                 streamedReasoning += filtered;
                                 reasoningTokens += Math.ceil(filtered.length / 4);
+                                emitStreamDelta(filtered, true);
                             } else {
                                 streamedContent += filtered;
                                 completionTokens += Math.ceil(filtered.length / 4);
+                                emitStreamDelta(filtered, false);
                             }
                         };
 
@@ -2751,6 +2856,7 @@ export function createApp(config) {
                                 }
                                 sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
+                                requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
                                 streamedContent = '';
                                 streamedReasoning = '';
                                 rawStreamedContent = '';
@@ -2814,17 +2920,31 @@ export function createApp(config) {
                             if (reasoning) sendDelta(reasoning, true);
                             if (content) sendDelta(content, false);
                         };
+                        let didFullPoll = false;
                         if (collected && (collected.__error || collected.noData)) {
                             logDebug('Anthropic SSE fallback to polling', { sessionId });
+                            didFullPoll = true;
                             await pollFallback('full');
-                        }
-                        if (collected && collected.idleTimeout && (streamedContent || streamedReasoning || streamedToolCalls.length > 0)) {
+                        } else if (collected && collected.idleTimeout && (streamedContent || streamedReasoning || streamedToolCalls.length > 0)) {
                             logDebug('Anthropic SSE idle timeout, polling for remainder', { sessionId });
                             await pollFallback('idleTimeout');
                         }
-                        if (!streamedContent && !streamedReasoning && streamedToolCalls.length === 0) {
+                        if (collected && !rawStreamedContent && !rawStreamedReasoning && (collected.reasoning || collected.content)) {
+                            if (collected.reasoning) sendDelta(collected.reasoning, true);
+                            if (collected.content) sendDelta(collected.content, false);
+                        }
+                        if (!didFullPoll && !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0) {
                             logDebug('Anthropic SSE returned empty, falling back to polling', { sessionId });
                             await pollFallback('full');
+                        } else if (rawStreamedReasoning && !rawStreamedContent && streamedToolCalls.length === 0) {
+                            logDebug('Anthropic reasoning streamed without content, reconciling from snapshot', { sessionId });
+                            const snapshot = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS).catch(() => null);
+                            if (snapshot && snapshot.content) {
+                                const remainingContent = rawStreamedContent
+                                    ? snapshot.content.slice(rawStreamedContent.length)
+                                    : snapshot.content;
+                                if (remainingContent) sendDelta(remainingContent, false);
+                            }
                         }
 
                         const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
@@ -2834,11 +2954,15 @@ export function createApp(config) {
                         if (flushedReasoningText) {
                             streamedReasoning += flushedReasoningText;
                             reasoningTokens += Math.ceil(flushedReasoningText.length / 4);
+                            emitStreamDelta(flushedReasoningText, true);
                         }
                         if (flushedContentText) {
                             streamedContent += flushedContentText;
                             completionTokens += Math.ceil(flushedContentText.length / 4);
+                            emitStreamDelta(flushedContentText, false);
                         }
+                        closeOpenBlock();
+
                         const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
                         const finalContentText = rawStreamedContent + flushedContentText;
 
@@ -2852,23 +2976,32 @@ export function createApp(config) {
                         if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0) {
                             parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
                         }
+                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedAnthropicToolCall();
+                            if (forcedResponse) {
+                                parsedToolCalls = parseExternalToolCallsFromText(
+                                    externalToolRegistry,
+                                    forcedResponse.reasoning,
+                                    forcedResponse.content
+                                );
+                            }
+                        }
 
-                        const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                        const { validCalls: rawValidatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                        const validatedToolCalls = disableParallelToolUse && rawValidatedToolCalls.length > 1
+                            ? rawValidatedToolCalls.slice(0, 1)
+                            : rawValidatedToolCalls;
 
                         if (keepaliveInterval) clearInterval(keepaliveInterval);
                         keepaliveInterval = null;
 
-                        const promptTokens = Math.ceil((fullPromptText || '').length / 4);
                         const outputTokens = completionTokens + reasoningTokens;
-                        const writeEvent = (event) => {
-                            res.write(`data: ${JSON.stringify(event)}\n\n`);
-                        };
 
                         // Upstream failed on every attempt and fallbacks recovered
                         // nothing: surface an Anthropic error event instead of an
                         // empty 200 message (clients cannot tell that apart).
                         const terminalError = collected?.error || collected?.__error || null;
-                        if (!streamedContent && !streamedReasoning && streamedToolCalls.length === 0 && terminalError) {
+                        if (!messageStarted && !streamedContent && !streamedReasoning && validatedToolCalls.length === 0 && terminalError) {
                             writeEvent({
                                 type: 'error',
                                 error: {
@@ -2881,33 +3014,8 @@ export function createApp(config) {
                             return;
                         }
 
-                        writeEvent({
-                            type: 'message_start',
-                            message: {
-                                id,
-                                type: 'message',
-                                role: 'assistant',
-                                model: `${pID}/${mID}`,
-                                content: [],
-                                stop_sequence: null,
-                                stop_reason: null,
-                                usage: { input_tokens: promptTokens, output_tokens: 0 }
-                            }
-                        });
+                        ensureMessageStart();
 
-                        let blockIndex = 0;
-                        if (streamedReasoning) {
-                            writeEvent({ type: 'content_block_start', index: blockIndex, content_block: { type: 'thinking', thinking: '' } });
-                            writeEvent({ type: 'content_block_delta', index: blockIndex, delta: { type: 'thinking_delta', thinking: streamedReasoning } });
-                            writeEvent({ type: 'content_block_stop', index: blockIndex });
-                            blockIndex += 1;
-                        }
-                        if (streamedContent) {
-                            writeEvent({ type: 'content_block_start', index: blockIndex, content_block: { type: 'text', text: '' } });
-                            writeEvent({ type: 'content_block_delta', index: blockIndex, delta: { type: 'text_delta', text: streamedContent } });
-                            writeEvent({ type: 'content_block_stop', index: blockIndex });
-                            blockIndex += 1;
-                        }
                         validatedToolCalls.forEach((call) => {
                             let input = {};
                             try {
@@ -2955,6 +3063,7 @@ export function createApp(config) {
                                 }
                                 sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
+                                requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
                                 await sleep(RETRY_BACKOFF_BASE_MS * attempt);
                             }
                             await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
@@ -2979,12 +3088,24 @@ export function createApp(config) {
                             // names (Error/OpenCodeError/...) are not valid types.
                             return anthropicError(502, 'api_error', error.data?.message || error.message || 'OpenCode provider error');
                         }
-                        const parsedToolCalls = externalToolRegistry.length > 0
+                        let parsedToolCalls = externalToolRegistry.length > 0
                             ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
                             : [];
-                        const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-                        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
-                        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
+                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedAnthropicToolCall();
+                            if (forcedResponse) {
+                                content = forcedResponse.content || content;
+                                reasoning = forcedResponse.reasoning || reasoning;
+                                parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                            }
+                        }
+                        const { validCalls: rawValidatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                        const validatedToolCalls = disableParallelToolUse && rawValidatedToolCalls.length > 1
+                            ? rawValidatedToolCalls.slice(0, 1)
+                            : rawValidatedToolCalls;
+                        const stripOptions = { registry: externalToolRegistry };
+                        const safeContent = stripFunctionCallMarkup(content, true, stripOptions);
+                        const safeReasoning = stripFunctionCallMarkup(reasoning, true, stripOptions);
 
                         const anthropicContent = [];
                         if (safeReasoning) anthropicContent.push({ type: 'thinking', thinking: safeReasoning });
