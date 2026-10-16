@@ -18,6 +18,7 @@ Turns a local [OpenCode](https://opencode.ai) runtime into an OpenAI-compatible 
 - **External tool bridge** — client-supplied `tools` return standard `tool_calls` / `function_call` from the proxy, never touching OpenCode built-in tools
 - **Built-in tool allowlist** — requests without `tools` only allow built-ins listed in `OPENCODE_INTERNAL_ALLOWED_TOOLS`
 - **Observability** — `/health/details` structured diagnostics, `/metrics` Prometheus metrics
+- **Web Panel** — optional built-in dashboard at `/panel` (read-only status/models/diagnostics), off by default
 - **Docker deployment** — one command starts the stack and the OpenCode backend
 
 ## 🚀 Quick Start
@@ -103,6 +104,49 @@ curl -X POST http://127.0.0.1:10000/v1/chat/completions \
 
 When the model calls tools, non-streaming responses return `message.tool_calls` and streaming responses return `delta.tool_calls`.
 
+### Anthropic Messages API (/v1/messages)
+
+An endpoint for Claude SDK / Anthropic clients. Authentication uses the `x-api-key` header (`Authorization: Bearer` also works), and tool calls come back as `tool_use` content blocks.
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "x-api-key: ***" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "max_tokens": 1024,
+    "system": "You are concise.",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'
+```
+
+Tool round-trip (send results back as `tool_result` blocks):
+
+```bash
+curl -X POST http://127.0.0.1:10000/v1/messages \
+  -H "x-api-key: ***" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "opencode/big-pickle",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Fetch the title of https://example.com"}],
+    "tools": [{
+      "name": "web_fetch",
+      "description": "Fetch a URL and return its content summary",
+      "input_schema": {
+        "type": "object",
+        "properties": {"url": {"type": "string"}},
+        "required": ["url"]
+      }
+    }]
+  }'
+```
+
+The response contains a `{"type":"tool_use","id":"…","name":"web_fetch","input":{…}}` content block (`stop_reason: "tool_use"`); send the result back as a `{"type":"tool_result","tool_use_id":"…","content":"…"}` user block to continue the conversation. With `stream: true` the proxy emits the Anthropic SSE sequence `message_start` → `content_block_*` → `message_delta` → `message_stop`.
+
 ## ⚙️ Configuration
 
 | Environment variable | Default | Description |
@@ -118,6 +162,7 @@ When the model calls tools, non-streaming responses return `message.tool_calls` 
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | Ignore the incoming system prompt |
 | `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | Auto-clean session storage |
 | `OPENCODE_USE_ISOLATED_HOME` | `false` | Use an isolated OpenCode config directory |
+| `OPENCODE_WEB_PANEL_ENABLED` | `false` | Serve the built-in Web Panel at `/panel` |
 | `OPENCODE_PROXY_DEBUG` | `false` | Debug logging |
 
 > 📄 Full reference: [Configuration](./docs/en/configuration.md)
@@ -140,9 +185,12 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/health` | Health check |
 | `GET` | `/health/details` | Structured diagnostics (toggle/auth configurable) |
 | `GET` | `/metrics` | Prometheus metrics (toggle/auth configurable) |
+| `GET` | `/panel` | Web Panel page (off by default; enable with `OPENCODE_WEB_PANEL_ENABLED=true`) |
+| `GET` | `/panel/data.json` | Web Panel data feed (Bearer/PUBLIC_DIAGNOSTICS gated, never returns secret values) |
 | `GET` | `/v1/models` | Model list |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
+| `POST` | `/v1/messages` | Anthropic Messages API (Claude SDK compatible) |
 | `GET` | `/admin/keys` | Multi-user key list and usage (admin auth, available once `API_KEYS` is configured) |
 | `POST` | `/admin/keys` | Add a user key at runtime (admin auth) |
 | `DELETE` | `/admin/keys/:name` | Remove a user key (admin auth) |
@@ -152,6 +200,12 @@ Model names: `opencode/big-pickle`, `gpt5-nano` (auto-resolved to `gpt-5-nano`),
 > 📖 See [API Reference](./docs/en/api-reference.md)
 >
 > 👥 Full details on multi-user keys, per-key usage metering, and the admin endpoints: [Configuration](./docs/en/configuration.md#-multi-user-api-keys).
+
+## 🖥️ Web Panel
+
+Set `OPENCODE_WEB_PANEL_ENABLED=true` (or `"WEB_PANEL_ENABLED": true` in config.json) and open `http://127.0.0.1:10000/panel` in a browser for a read-only dashboard: runtime status (status/uptime/backend URL), the model list, and backend diagnostics (tool-mode counters, cache state). Dark theme, zero external dependencies — no external CSS/JS, CSP locked to same-origin.
+
+With `API_KEY` configured, enter the proxy key in the page (kept in the browser's localStorage and used to call `/panel/data.json`); with `PUBLIC_DIAGNOSTICS=true` or no `API_KEY` no key is needed. When the panel is disabled both routes return 404, and the data feed never returns any secret values. See [Configuration](./docs/en/configuration.md).
 
 ## 🔧 Troubleshooting
 
@@ -179,5 +233,5 @@ MIT · see [LICENSE](./LICENSE.md)
 ## 🙏 Acknowledgements
 
 - [dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai)
-- [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) — the same-named Go gateway
+- [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api)
 - [lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy)

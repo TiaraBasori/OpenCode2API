@@ -10,9 +10,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+import { EXTERNAL_TOOL_PREFIX } from './tool-runtime/contracts.js';
 import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtime/registry.js';
 import { buildToolExposure } from './tool-runtime/router.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
+import { PANEL_CSP, PANEL_HTML } from './panel-page.js';
 import {
     stripFunctionCallMarkup,
     parseExternalToolCallsFromText,
@@ -830,7 +832,8 @@ export function createApp(config) {
         CLEANUP_MAX_AGE_MS,
         OPENCODE_HOME_BASE,
         EVENT_IDLE_TIMEOUT_MS = DEFAULT_EVENT_IDLE_TIMEOUT_MS,
-        EVENT_FIRST_DELTA_TIMEOUT_MS = DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS
+        EVENT_FIRST_DELTA_TIMEOUT_MS = DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
+        WEB_PANEL_ENABLED = false
     } = config;
 
     // Multi-user keys: parse once at app creation. Duplicate keys/names throw
@@ -865,7 +868,7 @@ export function createApp(config) {
     app.use(cors({
         origin: '*',
         methods: ['GET', 'POST', 'OPTIONS'],
-        allowedHeaders: ['Content-Type', 'Authorization']
+        allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key', 'anthropic-version']
     }));
     app.use(bodyParser.json({ limit: '50mb' }));
     app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
@@ -884,10 +887,37 @@ export function createApp(config) {
     app.use((req, res, next) => {
         if (req.method === 'OPTIONS' || req.path === '/health' || req.path === '/' || req.path === '/health/details' || req.path === '/metrics') return next();
         if (multiUserEnabled && (req.path === '/admin/keys' || req.path.startsWith('/admin/keys/'))) return next();
+        if (req.path === '/panel' || req.path === '/panel/data.json') {
+            // Disabled panel: the routes do not exist (404) regardless of auth.
+            if (!WEB_PANEL_ENABLED) {
+                return res.status(404).json({
+                    error: { message: `Route not found: ${req.method} ${req.path}`, type: 'not_found_error' }
+                });
+            }
+            // Enabled: both GET endpoints gate themselves — /panel is a static
+            // shell without data, /panel/data.json enforces the diagnostics
+            // auth (PUBLIC_DIAGNOSTICS / Bearer) inside its handler.
+            if (req.method === 'GET') return next();
+        }
         const token = extractBearerToken(req);
+        // Anthropic Messages clients authenticate via x-api-key; scope it to
+        // /v1/messages so the OpenAI-compatible endpoints stay Bearer-only.
+        const xApiKey = req.path === '/v1/messages' && typeof req.headers['x-api-key'] === 'string'
+            ? req.headers['x-api-key'].trim()
+            : '';
+        const candidateToken = token || xApiKey || null;
+        const rejectUnauthorized = () => {
+            if (req.path === '/v1/messages') {
+                return res.status(401).json({
+                    type: 'error',
+                    error: { type: 'authentication_error', message: 'invalid x-api-key' }
+                });
+            }
+            return res.status(401).json({ error: { message: 'Unauthorized' } });
+        };
         if (multiUserEnabled) {
             // API_KEYS hit wins and tags the request for per-key metering.
-            const matchedUserKeyName = findMatchingUserKeyName(token);
+            const matchedUserKeyName = findMatchingUserKeyName(candidateToken);
             if (matchedUserKeyName) {
                 req.apiKeyName = matchedUserKeyName;
                 return next();
@@ -896,14 +926,14 @@ export function createApp(config) {
         if (API_KEY && API_KEY.trim() !== '') {
             // Fall back to the legacy single key (old deployments are unaffected;
             // /admin/keys uses this same master key as its admin credential).
-            if (token && safeTokenEquals(token, API_KEY.trim())) {
+            if (candidateToken && safeTokenEquals(candidateToken, API_KEY.trim())) {
                 req.apiKeyName = MASTER_KEY_NAME;
                 return next();
             }
-            return res.status(401).json({ error: { message: 'Unauthorized' } });
+            return rejectUnauthorized();
         }
         if (multiUserEnabled) {
-            return res.status(401).json({ error: { message: 'Unauthorized' } });
+            return rejectUnauthorized();
         }
         next();
     });
@@ -2774,6 +2804,755 @@ export function createApp(config) {
         return resolveDiagnosticsCaller(req).allowed;
     };
 
+    // Anthropic Messages API endpoint
+    app.post('/v1/messages', async (req, res) => {
+        try {
+            await lock(async () => {
+                let sessionId = null;
+                let id = `msg_${crypto.randomUUID()}`;
+                let keepaliveInterval = null;
+                let stream = false;
+                let pID = 'opencode';
+                let mID = 'kimi-k2.5-free';
+
+                const anthropicError = (statusCode, type, message) => res.status(statusCode).json({
+                    type: 'error',
+                    error: { type, message }
+                });
+
+                try {
+                    const body = req.body || {};
+                    const { model, messages, system, stream: requestStream } = body;
+                    stream = Boolean(requestStream);
+                    keyUsage.trackRequest(req.apiKeyName);
+                    let usageMetered = false;
+                    const meterUsage = ({ promptTokens, completionTokens }) => {
+                        if (usageMetered) return;
+                        usageMetered = true;
+                        keyUsage.trackUsage(req.apiKeyName, { promptTokens, completionTokens });
+                    };
+
+                    if (!Array.isArray(messages) || messages.length === 0) {
+                        return anthropicError(400, 'invalid_request_error', 'messages: messages must be a non-empty array');
+                    }
+                    if (!Number.isInteger(body.max_tokens) || body.max_tokens <= 0) {
+                        return anthropicError(400, 'invalid_request_error', 'max_tokens: max_tokens is required and must be a positive integer');
+                    }
+                    if (!model || typeof model !== 'string') {
+                        return anthropicError(400, 'invalid_request_error', 'model: model is required');
+                    }
+
+                    // Anthropic tool definitions -> OpenAI function shape
+                    const tools = Array.isArray(body.tools)
+                        ? body.tools.map((tool) => ({
+                            type: 'function',
+                            function: {
+                                name: tool?.name,
+                                description: tool?.description,
+                                parameters: tool?.input_schema
+                            }
+                        })).filter((tool) => tool.function.name)
+                        : [];
+
+                    // Anthropic tool_choice -> OpenAI tool_choice
+                    const rawToolChoice = body.tool_choice;
+                    const disableParallelToolUse = Boolean(rawToolChoice && typeof rawToolChoice === 'object' && rawToolChoice.disable_parallel_tool_use === true);
+                    let toolChoice;
+                    if (rawToolChoice && typeof rawToolChoice === 'object') {
+                        if (rawToolChoice.type === 'auto') toolChoice = 'auto';
+                        else if (rawToolChoice.type === 'any') toolChoice = 'required';
+                        else if (rawToolChoice.type === 'tool' && rawToolChoice.name) {
+                            toolChoice = { type: 'function', function: { name: rawToolChoice.name } };
+                        } else if (rawToolChoice.type === 'none') {
+                            toolChoice = 'none';
+                        }
+                    } else if (rawToolChoice === 'auto' || rawToolChoice === 'required' || rawToolChoice === 'none') {
+                        toolChoice = rawToolChoice;
+                    }
+
+                    const requestParams = {
+                        max_tokens: body.max_tokens,
+                        temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
+                        top_p: typeof body.top_p === 'number' ? body.top_p : undefined,
+                        stop: Array.isArray(body.stop_sequences) ? body.stop_sequences : undefined,
+                        reasoning_effort: null
+                    };
+
+                    const resolvedModel = await resolveRequestedModel(model);
+                    pID = resolvedModel.providerID;
+                    mID = resolvedModel.modelID;
+                    if (resolvedModel.aliasFrom) {
+                        logDebug('Resolved model alias', { from: resolvedModel.aliasFrom, to: resolvedModel.resolved });
+                    }
+
+                    const buildAnthropicPromptParts = async (rawMessages, systemParam, externalToolRegistry = []) => {
+                        const parts = [];
+                        const systemChunks = [];
+                        const userContents = [];
+                        const assistantToolCalls = new Map();
+                        const formatRoleLine = (role, text) => `${role.toUpperCase()}: ${text}`;
+
+                        if (typeof systemParam === 'string' && systemParam.trim()) {
+                            systemChunks.push(systemParam);
+                        } else if (Array.isArray(systemParam)) {
+                            const text = systemParam
+                                .map((block) => (block && typeof block.text === 'string') ? block.text : '')
+                                .filter(Boolean)
+                                .join('\n\n');
+                            if (text) systemChunks.push(text);
+                        }
+
+                        const pushImagePart = async (source) => {
+                            let imageUrl = null;
+                            let fallbackMime = 'image/jpeg';
+                            if (source?.type === 'url' && typeof source.url === 'string') {
+                                imageUrl = source.url;
+                            } else if (source?.type === 'base64' && typeof source.data === 'string') {
+                                fallbackMime = source.media_type || fallbackMime;
+                                imageUrl = `data:${source.media_type || 'image/jpeg'};base64,${source.data}`;
+                            }
+                            if (!imageUrl) return;
+                            try {
+                                const dataUri = await getImageDataUri(imageUrl);
+                                const mime = dataUri.split(';')[0].split(':')[1] || fallbackMime;
+                                parts.push({ type: 'file', mime, url: dataUri, filename: 'image' });
+                            } catch (imgErr) {
+                                console.warn('[Proxy] Skipping image due to error:', imgErr.message);
+                            }
+                        };
+
+                        for (const m of rawMessages) {
+                            const role = m?.role === 'assistant' ? 'assistant' : 'user';
+                            const content = m?.content;
+                            const blocks = Array.isArray(content)
+                                ? content
+                                : (content !== undefined && content !== null && content !== '' ? [{ type: 'text', text: String(content) }] : []);
+
+                            if (role === 'assistant' && Array.isArray(m?.tool_calls) && m.tool_calls.length) {
+                                const serializedToolCalls = m.tool_calls.map((toolCall, index) => ({
+                                    id: toolCall?.id || `call_${index + 1}`,
+                                    name: findExternalToolByName(externalToolRegistry, toolCall?.function?.name || toolCall?.name)?.namespacedName || toolCall?.function?.name || toolCall?.name,
+                                    arguments: normalizeToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments)
+                                })).filter((toolCall) => toolCall.name);
+                                if (serializedToolCalls.length) {
+                                    serializedToolCalls.forEach((toolCall) => assistantToolCalls.set(toolCall.id, toolCall.name));
+                                    parts.push({
+                                        type: 'text',
+                                        text: `ASSISTANT: <function_calls>${JSON.stringify(serializedToolCalls)}</function_calls>`
+                                    });
+                                }
+                            }
+
+                            for (const block of blocks) {
+                                if (!block) continue;
+
+                                if (role === 'assistant' && block.type === 'tool_use') {
+                                    const name = findExternalToolByName(externalToolRegistry, block?.name)?.namespacedName || block?.name;
+                                    if (!name) continue;
+                                    const callId = block?.id || `call_${name.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+                                    assistantToolCalls.set(callId, name);
+                                    parts.push({
+                                        type: 'text',
+                                        text: `ASSISTANT: <function_calls>${JSON.stringify([{
+                                            id: callId,
+                                            name,
+                                            arguments: normalizeToolArguments(block?.input)
+                                        }])}</function_calls>`
+                                    });
+                                    continue;
+                                }
+
+                                if (role === 'user' && block.type === 'tool_result') {
+                                    const rawText = normalizeToolResultContent(block?.content);
+                                    const text = block?.is_error && !rawText ? 'Tool execution error' : rawText;
+                                    const mappedTool = findExternalToolByName(externalToolRegistry, block?.name)
+                                        || findExternalToolByName(externalToolRegistry, assistantToolCalls.get(block?.tool_use_id));
+                                    const fallbackSingleTool = !block?.tool_use_id && assistantToolCalls.size === 1
+                                        ? Array.from(assistantToolCalls.values())[0]
+                                        : null;
+                                    const toolName = mappedTool?.namespacedName
+                                        || assistantToolCalls.get(block?.tool_use_id)
+                                        || block?.name
+                                        || fallbackSingleTool
+                                        || `${EXTERNAL_TOOL_PREFIX}unknown`;
+                                    const toolCallId = block?.tool_use_id || `call_${toolName.replace(/[^a-zA-Z0-9_]/g, '_')}`;
+                                    parts.push({
+                                        type: 'text',
+                                        text: `TOOL_RESULT: ${JSON.stringify({
+                                            tool_call_id: toolCallId,
+                                            name: toolName,
+                                            content: text,
+                                            ...(block?.is_error ? { is_error: true } : {})
+                                        })}`
+                                    });
+                                    continue;
+                                }
+
+                                if (block.type === 'image') {
+                                    await pushImagePart(block?.source);
+                                    continue;
+                                }
+
+                                if (block.type === 'text' && block.text) {
+                                    if (role === 'user') userContents.push(block.text);
+                                    parts.push({ type: 'text', text: formatRoleLine(role, block.text) });
+                                }
+                            }
+                        }
+
+                        return {
+                            parts,
+                            system: systemChunks.join('\n\n'),
+                            fullPromptText: parts.map(p => p.text).join('\n\n'),
+                            lastUserMsg: userContents[userContents.length - 1] || ''
+                        };
+                    };
+
+                    const requestToolContext = createRequestToolContext(tools, toolChoice, body.opencode);
+                    const toolMode = requestToolContext.mode;
+                    const externalToolContext = requestToolContext.external;
+                    const externalToolRegistry = externalToolContext.registry;
+                    const externalToolChoice = externalToolContext.toolChoice;
+                    const internalToolContext = requestToolContext.internal;
+                    trackToolMode(toolMode, {
+                        configuredAllowlist: internalToolContext.allowedToolNames,
+                        requestedAllowlist: internalToolContext.requestedAllowlist,
+                        deniedRequestedTools: internalToolContext.deniedRequestedTools,
+                        resolutionPath: internalToolContext.resolutionPath,
+                        resultingMode: internalToolContext.resultingMode,
+                        route: '/v1/messages'
+                    });
+
+                    const { parts, system: systemMsg, fullPromptText, lastUserMsg } = await buildAnthropicPromptParts(messages, system, externalToolRegistry);
+                    const systemWithGuard = buildSystemPrompt(
+                        [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
+                        requestParams.reasoning_effort,
+                        toolMode,
+                        internalToolContext.allowedToolNames
+                    );
+                    if (!parts.length) {
+                        return anthropicError(400, 'invalid_request_error', 'messages: messages must include at least one text, image or tool block');
+                    }
+                    logDebug('Anthropic request start', {
+                        model: `${pID}/${mID}`,
+                        stream,
+                        userMessages: messages.length,
+                        system: Boolean(systemMsg),
+                        parts: parts.length,
+                        toolMode
+                    });
+
+                    await ensureBackend(config);
+                    try {
+                        await client.config.update({
+                            body: { activeModel: { providerID: pID, modelID: mID } }
+                        });
+                    } catch (confError) {
+                        logDebug('Failed to set active model:', confError.message);
+                    }
+
+                    const toolControl = await resolveToolControl(toolMode, internalToolContext);
+                    sessionId = await createSession(toolControl);
+                    logDebug('Session created', { sessionId });
+
+                    const promptParams = {
+                        path: { id: sessionId },
+                        body: {
+                            model: { providerID: pID, modelID: mID },
+                            system: systemWithGuard,
+                            parts,
+                            ...(requestParams.max_tokens && { max_tokens: requestParams.max_tokens }),
+                            ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
+                            ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
+                            ...(requestParams.stop && { stop: requestParams.stop })
+                        }
+                    };
+                    const { toolOverrides } = toolControl;
+                    if (toolOverrides && Object.keys(toolOverrides).length > 0) {
+                        promptParams.body.tools = toolOverrides;
+                    }
+
+                    const makeForcedAnthropicToolCallRequester = () => createForcedToolCallRequester({
+                        mode: externalToolChoice.mode,
+                        sessionId,
+                        systemWithGuard,
+                        requiredTool: externalToolChoice.requiredTool || externalToolRegistry[0]?.namespacedName,
+                        providerID: pID,
+                        modelID: mID,
+                        toolOverrides,
+                        requestTimeoutMs: REQUEST_TIMEOUT_MS,
+                        forbidThinkBlock: true
+                    });
+                    let requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
+
+                    res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
+                    res.setHeader('Cache-Control', 'no-cache');
+                    res.setHeader('Connection', 'keep-alive');
+
+                    const anthropicStopReason = (toolUseCount) => (toolUseCount > 0 ? 'tool_use' : 'end_turn');
+
+                    if (stream) {
+                        const shouldStripStreamingToolMarkup = externalToolRegistry.length > 0;
+                        const filterContentDelta = createToolCallFilter({
+                            disableTools: DISABLE_TOOLS,
+                            forceStrip: shouldStripStreamingToolMarkup,
+                            registry: externalToolRegistry
+                        });
+                        const filterReasoningDelta = createToolCallFilter({
+                            disableTools: DISABLE_TOOLS,
+                            forceStrip: shouldStripStreamingToolMarkup,
+                            registry: externalToolRegistry
+                        });
+                        const parseContentToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                        const parseReasoningToolCalls = createExternalToolCallStreamParser(externalToolRegistry);
+                        let streamedContent = '';
+                        let streamedReasoning = '';
+                        let rawStreamedContent = '';
+                        let rawStreamedReasoning = '';
+                        const streamedToolCalls = [];
+                        let completionTokens = 0;
+                        let reasoningTokens = 0;
+                        const promptTokens = Math.ceil((fullPromptText || '').length / 4);
+
+                        const writeEvent = (event) => {
+                            if (!res.destroyed) {
+                                res.write(`data: ${JSON.stringify(event)}\n\n`);
+                            }
+                        };
+
+                        let messageStarted = false;
+                        let blockIndex = 0;
+                        let openBlock = null;
+
+                        const ensureMessageStart = () => {
+                            if (messageStarted) return;
+                            messageStarted = true;
+                            writeEvent({
+                                type: 'message_start',
+                                message: {
+                                    id,
+                                    type: 'message',
+                                    role: 'assistant',
+                                    model: `${pID}/${mID}`,
+                                    content: [],
+                                    stop_sequence: null,
+                                    stop_reason: null,
+                                    usage: { input_tokens: promptTokens, output_tokens: 0 }
+                                }
+                            });
+                        };
+
+                        const closeOpenBlock = () => {
+                            if (!openBlock) return;
+                            writeEvent({ type: 'content_block_stop', index: openBlock.index });
+                            openBlock = null;
+                        };
+
+                        const emitStreamDelta = (text, isReasoning = false) => {
+                            if (!text) return;
+                            ensureMessageStart();
+                            const targetType = isReasoning ? 'thinking' : 'text';
+                            if (openBlock && openBlock.type !== targetType) {
+                                closeOpenBlock();
+                            }
+                            if (!openBlock) {
+                                const idx = blockIndex;
+                                blockIndex += 1;
+                                openBlock = { type: targetType, index: idx };
+                                writeEvent({
+                                    type: 'content_block_start',
+                                    index: idx,
+                                    content_block: targetType === 'thinking'
+                                        ? { type: 'thinking', thinking: '' }
+                                        : { type: 'text', text: '' }
+                                });
+                            }
+                            writeEvent({
+                                type: 'content_block_delta',
+                                index: openBlock.index,
+                                delta: targetType === 'thinking'
+                                    ? { type: 'thinking_delta', thinking: text }
+                                    : { type: 'text_delta', text }
+                            });
+                        };
+
+                        keepaliveInterval = setInterval(() => {
+                            if (!res.destroyed) {
+                                res.write(': keepalive\n\n');
+                            }
+                        }, 15000);
+
+                        const sendDelta = (delta, isReasoning = false) => {
+                            if (!delta) return;
+                            if (isReasoning) rawStreamedReasoning += delta;
+                            else rawStreamedContent += delta;
+                            const parsedDeltaToolCalls = isReasoning
+                                ? parseReasoningToolCalls(delta)
+                                : parseContentToolCalls(delta);
+                            parsedDeltaToolCalls.forEach((toolCall) => streamedToolCalls.push(toolCall));
+                            const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
+                            if (!filtered) return;
+                            if (isReasoning) {
+                                streamedReasoning += filtered;
+                                reasoningTokens += Math.ceil(filtered.length / 4);
+                                emitStreamDelta(filtered, true);
+                            } else {
+                                streamedContent += filtered;
+                                completionTokens += Math.ceil(filtered.length / 4);
+                                emitStreamDelta(filtered, false);
+                            }
+                        };
+
+                        let collected = null;
+                        for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+                            if (attempt > 1) {
+                                // Retry on a fresh session (same rationale as chat completions).
+                                try {
+                                    await client.session.delete({ path: { id: sessionId } });
+                                } catch (e) {
+                                    logDebug('Failed to delete retried session', { sessionId, error: e.message });
+                                }
+                                sessionId = await createSession(toolControl);
+                                promptParams.path.id = sessionId;
+                                requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
+                                streamedContent = '';
+                                streamedReasoning = '';
+                                rawStreamedContent = '';
+                                rawStreamedReasoning = '';
+                                streamedToolCalls.length = 0;
+                                completionTokens = 0;
+                                reasoningTokens = 0;
+                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                            }
+                            try {
+                                const collectPromise = collectFromEvents(
+                                    sessionId,
+                                    REQUEST_TIMEOUT_MS,
+                                    sendDelta,
+                                    EVENT_FIRST_DELTA_TIMEOUT_MS,
+                                    EVENT_IDLE_TIMEOUT_MS
+                                );
+                                const safeCollect = collectPromise.catch((err) => ({ __error: err }));
+                                client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
+                                collected = await safeCollect;
+                            } catch (e) {
+                                logDebug('Anthropic stream error:', e.message);
+                            }
+
+                            const attemptError = collected?.error || collected?.__error || null;
+                            const nothingStreamed = !rawStreamedContent
+                                && !rawStreamedReasoning
+                                && streamedToolCalls.length === 0;
+                            if (
+                                attemptError
+                                && nothingStreamed
+                                && attempt < RETRY_MAX_ATTEMPTS
+                                && isTransientUpstreamError(attemptError)
+                            ) {
+                                console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, attemptError.data?.message || attemptError.message || attemptError.name || 'unknown');
+                                continue;
+                            }
+                            break;
+                        }
+
+                        const pollFallback = async (mode) => {
+                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (error && !content && !reasoning) {
+                                logDebug('Anthropic stream fallback error', { error: error.message });
+                                return;
+                            }
+                            if (mode === 'idleTimeout') {
+                                // Same guard as chat completions: the SSE pipe may have
+                                // delivered a prefix before going idle, so only the
+                                // remainder is sent to avoid duplicating text.
+                                const remainingReasoning = reasoning && reasoning.startsWith(rawStreamedReasoning)
+                                    ? reasoning.slice(rawStreamedReasoning.length)
+                                    : reasoning;
+                                const remainingContent = content && content.startsWith(rawStreamedContent)
+                                    ? content.slice(rawStreamedContent.length)
+                                    : content;
+                                if (remainingReasoning) sendDelta(remainingReasoning, true);
+                                if (remainingContent) sendDelta(remainingContent, false);
+                                return;
+                            }
+                            if (reasoning) sendDelta(reasoning, true);
+                            if (content) sendDelta(content, false);
+                        };
+                        let didFullPoll = false;
+                        if (collected && (collected.__error || collected.noData)) {
+                            logDebug('Anthropic SSE fallback to polling', { sessionId });
+                            didFullPoll = true;
+                            await pollFallback('full');
+                        } else if (collected && collected.idleTimeout && (streamedContent || streamedReasoning || streamedToolCalls.length > 0)) {
+                            logDebug('Anthropic SSE idle timeout, polling for remainder', { sessionId });
+                            await pollFallback('idleTimeout');
+                        }
+                        if (collected && !rawStreamedContent && !rawStreamedReasoning && (collected.reasoning || collected.content)) {
+                            if (collected.reasoning) sendDelta(collected.reasoning, true);
+                            if (collected.content) sendDelta(collected.content, false);
+                        }
+                        if (!didFullPoll && !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0) {
+                            logDebug('Anthropic SSE returned empty, falling back to polling', { sessionId });
+                            await pollFallback('full');
+                        } else if (rawStreamedReasoning && !rawStreamedContent && streamedToolCalls.length === 0) {
+                            logDebug('Anthropic reasoning streamed without content, reconciling from snapshot', { sessionId });
+                            const snapshot = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS).catch(() => null);
+                            if (snapshot && snapshot.content) {
+                                const remainingContent = rawStreamedContent
+                                    ? snapshot.content.slice(rawStreamedContent.length)
+                                    : snapshot.content;
+                                if (remainingContent) sendDelta(remainingContent, false);
+                            }
+                        }
+
+                        const flushedReasoningCalls = parseReasoningToolCalls.flush ? parseReasoningToolCalls.flush() : [];
+                        const flushedContentCalls = parseContentToolCalls.flush ? parseContentToolCalls.flush() : [];
+                        const flushedReasoningText = filterReasoningDelta.flush ? filterReasoningDelta.flush() : '';
+                        const flushedContentText = filterContentDelta.flush ? filterContentDelta.flush() : '';
+                        if (flushedReasoningText) {
+                            streamedReasoning += flushedReasoningText;
+                            reasoningTokens += Math.ceil(flushedReasoningText.length / 4);
+                            emitStreamDelta(flushedReasoningText, true);
+                        }
+                        if (flushedContentText) {
+                            streamedContent += flushedContentText;
+                            completionTokens += Math.ceil(flushedContentText.length / 4);
+                            emitStreamDelta(flushedContentText, false);
+                        }
+                        closeOpenBlock();
+
+                        const finalReasoningText = rawStreamedReasoning + flushedReasoningText;
+                        const finalContentText = rawStreamedContent + flushedContentText;
+
+                        let parsedToolCalls = streamedToolCalls.length > 0
+                            ? streamedToolCalls
+                            : [
+                                ...flushedReasoningCalls,
+                                ...flushedContentCalls,
+                                ...parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText, finalContentText)
+                            ];
+                        if (parsedToolCalls.length === 0 && externalToolRegistry.length > 0) {
+                            parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, finalReasoningText + finalContentText);
+                        }
+                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedAnthropicToolCall();
+                            if (forcedResponse) {
+                                parsedToolCalls = parseExternalToolCallsFromText(
+                                    externalToolRegistry,
+                                    forcedResponse.reasoning,
+                                    forcedResponse.content
+                                );
+                            }
+                        }
+
+                        const { validCalls: rawValidatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                        const validatedToolCalls = disableParallelToolUse && rawValidatedToolCalls.length > 1
+                            ? rawValidatedToolCalls.slice(0, 1)
+                            : rawValidatedToolCalls;
+
+                        if (keepaliveInterval) clearInterval(keepaliveInterval);
+                        keepaliveInterval = null;
+
+                        const outputTokens = completionTokens + reasoningTokens;
+
+                        // Upstream failed on every attempt and fallbacks recovered
+                        // nothing: surface an Anthropic error event instead of an
+                        // empty 200 message (clients cannot tell that apart).
+                        const terminalError = collected?.error || collected?.__error || null;
+                        if (!messageStarted && !streamedContent && !streamedReasoning && validatedToolCalls.length === 0 && terminalError) {
+                            writeEvent({
+                                type: 'error',
+                                error: {
+                                    type: 'api_error',
+                                    message: terminalError.data?.message || terminalError.message || 'OpenCode provider error'
+                                }
+                            });
+                            writeEvent({ type: 'message_stop' });
+                            res.end();
+                            return;
+                        }
+
+                        ensureMessageStart();
+
+                        validatedToolCalls.forEach((call) => {
+                            let input = {};
+                            try {
+                                input = JSON.parse(call.function.arguments);
+                            } catch (e) {
+                                input = {};
+                            }
+                            writeEvent({
+                                type: 'content_block_start',
+                                index: blockIndex,
+                                content_block: {
+                                    type: 'tool_use',
+                                    id: call.id,
+                                    name: call.tool?.originalName || call.function.name,
+                                    input: {}
+                                }
+                            });
+                            writeEvent({
+                                type: 'content_block_delta',
+                                index: blockIndex,
+                                delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) }
+                            });
+                            writeEvent({ type: 'content_block_stop', index: blockIndex });
+                            blockIndex += 1;
+                        });
+
+                        writeEvent({
+                            type: 'message_delta',
+                            delta: { stop_reason: anthropicStopReason(validatedToolCalls.length), stop_sequence: null },
+                            usage: { output_tokens: outputTokens }
+                        });
+                        meterUsage({ promptTokens, completionTokens: outputTokens });
+                        writeEvent({ type: 'message_stop' });
+                        res.end();
+                    } else {
+                        let content = '';
+                        let reasoning = '';
+                        let error = null;
+                        for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+                            if (attempt > 1) {
+                                // Retry on a fresh session (same rationale as chat completions).
+                                try {
+                                    await client.session.delete({ path: { id: sessionId } });
+                                } catch (e) {
+                                    logDebug('Failed to delete retried session', { sessionId, error: e.message });
+                                }
+                                sessionId = await createSession(toolControl);
+                                promptParams.path.id = sessionId;
+                                requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
+                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                            }
+                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            content = collected.content || '';
+                            reasoning = collected.reasoning || '';
+                            error = collected.error || null;
+                            if (
+                                error
+                                && !content
+                                && !reasoning
+                                && attempt < RETRY_MAX_ATTEMPTS
+                                && isTransientUpstreamError(error)
+                            ) {
+                                console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, error.data?.message || error.message || error.name || 'unknown');
+                                continue;
+                            }
+                            break;
+                        }
+                        if (error && !content && !reasoning) {
+                            // 5xx keeps a normalized Anthropic type: upstream error
+                            // names (Error/OpenCodeError/...) are not valid types.
+                            return anthropicError(502, 'api_error', error.data?.message || error.message || 'OpenCode provider error');
+                        }
+                        let parsedToolCalls = externalToolRegistry.length > 0
+                            ? parseExternalToolCallsFromText(externalToolRegistry, reasoning, content)
+                            : [];
+                        if (parsedToolCalls.length === 0 && externalToolChoice.mode === 'required') {
+                            const forcedResponse = await requestForcedAnthropicToolCall();
+                            if (forcedResponse) {
+                                content = forcedResponse.content || content;
+                                reasoning = forcedResponse.reasoning || reasoning;
+                                parsedToolCalls = parseExternalToolCallsFromText(externalToolRegistry, reasoning, content);
+                            }
+                        }
+                        const { validCalls: rawValidatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
+                        const validatedToolCalls = disableParallelToolUse && rawValidatedToolCalls.length > 1
+                            ? rawValidatedToolCalls.slice(0, 1)
+                            : rawValidatedToolCalls;
+                        const stripOptions = { registry: externalToolRegistry };
+                        const safeContent = stripFunctionCallMarkup(content, true, stripOptions);
+                        const safeReasoning = stripFunctionCallMarkup(reasoning, true, stripOptions);
+
+                        const anthropicContent = [];
+                        if (safeReasoning) anthropicContent.push({ type: 'thinking', thinking: safeReasoning });
+                        if (safeContent) anthropicContent.push({ type: 'text', text: safeContent });
+                        validatedToolCalls.forEach((call) => {
+                            let input = {};
+                            try {
+                                input = JSON.parse(call.function.arguments);
+                            } catch (e) {
+                                input = {};
+                            }
+                            anthropicContent.push({
+                                type: 'tool_use',
+                                id: call.id,
+                                name: call.tool?.originalName || call.function.name,
+                                input
+                            });
+                        });
+
+                        const promptTokens = Math.ceil((fullPromptText || '').length / 4);
+                        const completionTokensCalc = Math.ceil((content || '').length / 4);
+                        const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
+                        meterUsage({ promptTokens, completionTokens: completionTokensCalc + reasoningTokensCalc });
+
+                        res.json({
+                            id,
+                            type: 'message',
+                            role: 'assistant',
+                            model: `${pID}/${mID}`,
+                            content: anthropicContent,
+                            stop_reason: anthropicStopReason(validatedToolCalls.length),
+                            stop_sequence: null,
+                            usage: {
+                                input_tokens: promptTokens,
+                                output_tokens: completionTokensCalc + reasoningTokensCalc
+                            }
+                        });
+                    }
+                } catch (error) {
+                    console.error('[Proxy] Anthropic API Error:', error.message);
+                    if (keepaliveInterval) clearInterval(keepaliveInterval);
+
+                    if (error.code === 'model_not_found') {
+                        if (!res.headersSent) {
+                            return anthropicError(400, 'model_not_found', error.message || `Model not found: ${req.body?.model}`);
+                        }
+                        console.error('[Proxy] Anthropic model_not_found after headers were sent; cannot report a 400 error body');
+                    }
+                    if (!res.headersSent) {
+                        const transformed = transformUpstreamError(error);
+                        return res.status(transformed.statusCode).json({
+                            type: 'error',
+                            error: {
+                                // model_not_found is an Anthropic error type, not an
+                                // upstream error code; normalize the mapping so the
+                                // shape stays consistent instead of leaking a
+                                // provider-specific type on a 5xx.
+                                type: transformed.statusCode >= 500
+                                    ? 'api_error'
+                                    : (transformed.error.code || transformed.error.type || 'api_error'),
+                                message: transformed.error.message
+                            }
+                        });
+                    }
+                    if (!res.destroyed) {
+                        res.write(`data: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: error.message } })}\n\n`);
+                        res.write(`data: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+                        res.end();
+                    }
+                    if (sessionId) {
+                        try {
+                            await client.session.delete({ path: { id: sessionId } });
+                        } catch (e) {
+                            console.error('[Proxy] Failed to cleanup session on error:', e.message);
+                        }
+                    }
+                } finally {
+                    if (typeof keepaliveInterval !== 'undefined' && keepaliveInterval) clearInterval(keepaliveInterval);
+                }
+            }, REQUEST_TIMEOUT_MS + 20000);
+        } catch (error) {
+            console.error('[Proxy] Anthropic Request Handler Error:', error.message);
+            if (!res.headersSent) {
+                res.status(500).json({ type: 'error', error: { type: 'api_error', message: error.message } });
+            }
+        }
+    });
+
     // Per-key usage snapshot shared by /admin/keys and /health/details.
     // In multi-user mode the legacy API_KEY appears as a pseudo-entry so
     // traffic that fell back to the master key is not invisible.
@@ -2873,6 +3652,61 @@ export function createApp(config) {
         status: 'ok',
         proxy: true
     }));
+
+    // --- Built-in Web Panel (optional, read-only) ---
+    // GET /panel serves a self-contained HTML shell (no data, no secrets).
+    // The page's script fetches /panel/data.json, which assembles everything
+    // from data the proxy already exposes: /v1/models, /health/details and
+    // process.uptime(). It never returns OPENCODE_SERVER_PASSWORD,
+    // ZEN_API_KEY, API_KEY or API_KEYS values.
+    if (WEB_PANEL_ENABLED) {
+        app.get('/panel', (_req, res) => {
+            res.setHeader('Content-Type', 'text/html; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.setHeader('Content-Security-Policy', PANEL_CSP);
+            res.send(PANEL_HTML);
+        });
+
+        app.get('/panel/data.json', async (req, res) => {
+            if (!shouldAllowOperationalEndpoint(req, { enabled: true })) {
+                return res.status(401).json({ error: { message: 'Unauthorized' } });
+            }
+            const payload = {
+                status: 'ok',
+                proxy: true,
+                uptime: process.uptime(),
+                backend_url: OPENCODE_SERVER_URL,
+                public_diagnostics: PUBLIC_DIAGNOSTICS === true,
+                models: [],
+                health: null
+            };
+            try {
+                payload.models = buildModelsList(await getProvidersList());
+            } catch (e) {
+                logDebug('Panel model list failed', { error: e.message });
+            }
+            if (HEALTH_DETAILS_ENABLED) {
+                payload.health = {
+                    status: 'ok',
+                    proxy: true,
+                    internal_tools: {
+                        config: { allowed_tools: SERVER_INTERNAL_ALLOWED_TOOL_NAMES },
+                        metrics: { ...internalToolMetrics },
+                        cache: {
+                            tool_ids_cached: !!cachedToolIds,
+                            tool_id_count: cachedToolIds ? cachedToolIds.length : 0,
+                            age_ms: cachedToolIdsAt ? Date.now() - cachedToolIdsAt : null
+                        }
+                    }
+                };
+            }
+            res.setHeader('Content-Type', 'application/json; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-store');
+            res.setHeader('X-Content-Type-Options', 'nosniff');
+            res.json(payload);
+        });
+    }
 
     app.get('/health/details', (req, res) => {
         if (!shouldAllowOperationalEndpoint(req, { enabled: HEALTH_DETAILS_ENABLED })) {
@@ -3987,6 +4821,9 @@ export function startProxy(options) {
             false,
         CLEANUP_INTERVAL_MS: Number.isFinite(cleanupIntervalMs) && cleanupIntervalMs > 0 ? cleanupIntervalMs : 12 * 60 * 60 * 1000,
         CLEANUP_MAX_AGE_MS: Number.isFinite(cleanupMaxAgeMs) && cleanupMaxAgeMs > 0 ? cleanupMaxAgeMs : 24 * 60 * 60 * 1000,
+        WEB_PANEL_ENABLED: normalizeBool(options.WEB_PANEL_ENABLED) ??
+            normalizeBool(process.env.OPENCODE_WEB_PANEL_ENABLED) ??
+            false,
         OPENCODE_HOME_BASE: options.OPENCODE_HOME_BASE || null,
         EVENT_IDLE_TIMEOUT_MS: options.EVENT_IDLE_TIMEOUT_MS,
         EVENT_FIRST_DELTA_TIMEOUT_MS: options.EVENT_FIRST_DELTA_TIMEOUT_MS

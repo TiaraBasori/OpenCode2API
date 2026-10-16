@@ -233,4 +233,41 @@ describe('multiuser edge review', () => {
             .send({ name: 'clash', key: cfg.API_KEY });
         expect(res.status).toBe(400);
     });
+
+    test('/v1/messages authenticates multi-user x-api-key and meters per-key usage', async () => {
+        const cfg = baseConfig();
+        const aliceKey = cfg.API_KEYS[0].key;
+        const { app } = createApp(cfg);
+        okSession();
+
+        const res = await request(app).post('/v1/messages')
+            .set('x-api-key', aliceKey)
+            .send({ model: 'opencode/m', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] });
+        expect(res.status).toBe(200);
+
+        const badRes = await request(app).post('/v1/messages')
+            .set('x-api-key', 'bad-key')
+            .send({ model: 'opencode/m', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] });
+        expect(badRes.status).toBe(401);
+        expect(badRes.body.error?.type).toBe('authentication_error');
+
+        const details = await request(app).get('/health/details')
+            .set('Authorization', `Bearer ${cfg.API_KEY}`);
+        expect(details.body.usage.byKey.alice.requests).toBe(1);
+        expect(details.body.usage.byKey.alice.totalTokens).toBeGreaterThan(0);
+    });
+
+    test('/panel/data.json requires auth in multi-user mode even when API_KEY is empty', async () => {
+        const cfg = { ...baseConfig(), API_KEY: '', WEB_PANEL_ENABLED: true, PUBLIC_DIAGNOSTICS: false };
+        const aliceKey = cfg.API_KEYS[0].key;
+        const { app } = createApp(cfg);
+        okSession();
+
+        const unauth = await request(app).get('/panel/data.json');
+        expect(unauth.status).toBe(401);
+
+        const authed = await request(app).get('/panel/data.json')
+            .set('Authorization', `Bearer ${aliceKey}`);
+        expect(authed.status).toBe(200);
+    });
 });
