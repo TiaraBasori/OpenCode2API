@@ -11,7 +11,8 @@
  * NOTE: this file is a template literal — it must not contain backticks or
  * "${" sequences, and the page script must not contain "</script>".
  */
-export const PANEL_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+export const PANEL_META_CSP = "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'";
+export const PANEL_CSP = `${PANEL_META_CSP}; frame-ancestors 'none'`;
 
 export const PANEL_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -19,7 +20,7 @@ export const PANEL_HTML = `<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="${PANEL_META_CSP}">
 <title>OpenCode2API · Panel</title>
 <style>
 :root { color-scheme: dark; }
