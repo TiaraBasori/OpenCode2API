@@ -18,6 +18,7 @@
 - **外部工具桥接** — 客户端传入 `tools`，代理返回标准 `tool_calls` / `function_call`，不触发 OpenCode 内置工具
 - **内置工具 allowlist** — 请求未带 `tools` 时，仅放行 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 声明的内置工具
 - **可观测性** — `/health/details` 结构化诊断，`/metrics` Prometheus 指标
+- **Web Panel** — 可选内置面板（`/panel`），只读展示状态/模型/诊断，默认关闭
 - **Docker 部署** — 一键启动，自动拉起 OpenCode 后端
 
 ## 🚀 快速开始
@@ -160,6 +161,7 @@ curl -X POST http://127.0.0.1:10000/v1/messages \
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | 忽略传入的 system prompt |
 | `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | 自动清理会话存储 |
 | `OPENCODE_USE_ISOLATED_HOME` | `false` | 使用隔离的 OpenCode 配置目录 |
+| `OPENCODE_WEB_PANEL_ENABLED` | `false` | 开启内置 Web Panel（`/panel`） |
 | `OPENCODE_PROXY_DEBUG` | `false` | 调试日志 |
 
 > 📄 完整配置见 [配置详解](./docs/zh/configuration.md)
@@ -182,6 +184,8 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/health` | 健康检查 |
 | `GET` | `/health/details` | 结构化诊断（可配置开关/鉴权） |
 | `GET` | `/metrics` | Prometheus 指标（可配置开关/鉴权） |
+| `GET` | `/panel` | Web Panel 页面（默认关闭，`OPENCODE_WEB_PANEL_ENABLED=true` 开启） |
+| `GET` | `/panel/data.json` | Web Panel 数据源（Bearer/PUBLIC_DIAGNOSTICS 门禁，永不返回密钥值） |
 | `GET` | `/v1/models` | 模型列表 |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
@@ -190,6 +194,12 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 模型名称写法：`opencode/big-pickle`、`gpt5-nano`（自动解析为 `gpt-5-nano`）、`opencode/gpt5-nano`。
 
 > 📖 详见 [API 参考](./docs/zh/api-reference.md)
+
+## 🖥️ Web Panel
+
+设 `OPENCODE_WEB_PANEL_ENABLED=true`（或在 config.json 设 `"WEB_PANEL_ENABLED": true`）后，浏览器访问 `http://127.0.0.1:10000/panel` 即可查看只读仪表盘：运行状态（状态/uptime/后端地址）、模型列表、后端诊断（工具模式计数、缓存状态）。页面深色主题、零外部依赖（无外链 CSS/JS，CSP 限定同源）。
+
+配置 `API_KEY` 后，在页面输入代理密钥即可（保存在浏览器 localStorage，用于请求 `/panel/data.json`）；`PUBLIC_DIAGNOSTICS=true` 或未配置 `API_KEY` 时无需输入。面板关闭时两个路由均为 404，数据端点永远不会返回任何密钥值。详见 [配置详解](./docs/zh/configuration.md)。
 
 ## 🔧 故障排查
 
@@ -217,5 +227,5 @@ MIT · 详见 [LICENSE](./LICENSE.md)
 ## 🙏 致谢
 
 - [dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai)
-- [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) — 同名 Go 网关
+- [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api)
 - [lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy)

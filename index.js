@@ -46,6 +46,7 @@ const defaultConfig = {
     AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env.OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS, false),
     CLEANUP_INTERVAL_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_INTERVAL_MS) || 43200000,
     CLEANUP_MAX_AGE_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || 86400000,
+    WEB_PANEL_ENABLED: false,
     // Event-stream timeouts. These used to be environment-only, which made them
     // easy to lose depending on how the process was started; they can now also
     // live in config.json so every launch path picks them up.
@@ -89,6 +90,7 @@ const finalConfig = {
     AUTO_CLEANUP_CONVERSATIONS: parseBool(process.env.OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS, parseBool(fileConfig.AUTO_CLEANUP_CONVERSATIONS, defaultConfig.AUTO_CLEANUP_CONVERSATIONS)),
     CLEANUP_INTERVAL_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_INTERVAL_MS) || fileConfig.CLEANUP_INTERVAL_MS || defaultConfig.CLEANUP_INTERVAL_MS,
     CLEANUP_MAX_AGE_MS: parseInt(process.env.OPENCODE_PROXY_CLEANUP_MAX_AGE_MS) || fileConfig.CLEANUP_MAX_AGE_MS || defaultConfig.CLEANUP_MAX_AGE_MS,
+    WEB_PANEL_ENABLED: parseBool(process.env.OPENCODE_WEB_PANEL_ENABLED, parseBool(fileConfig.WEB_PANEL_ENABLED, defaultConfig.WEB_PANEL_ENABLED)),
     // undefined => keep the library default (8000 / 30000)
     EVENT_IDLE_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || parseInt(fileConfig.EVENT_IDLE_TIMEOUT_MS) || undefined,
     EVENT_FIRST_DELTA_TIMEOUT_MS: parseInt(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || parseInt(fileConfig.EVENT_FIRST_DELTA_TIMEOUT_MS) || undefined
@@ -128,6 +130,7 @@ console.log(`  - Internal Allowed Tools: ${finalConfig.INTERNAL_ALLOWED_TOOLS.le
 console.log(`  - Health Details Enabled: ${finalConfig.HEALTH_DETAILS_ENABLED ? 'Yes' : 'No'}`);
 console.log(`  - Metrics Enabled: ${finalConfig.METRICS_ENABLED ? 'Yes' : 'No'}`);
 console.log(`  - Public Diagnostics: ${finalConfig.PUBLIC_DIAGNOSTICS ? 'Yes (no auth on /health/details & /metrics)' : 'No'}`);
+console.log(`  - Web Panel: ${finalConfig.WEB_PANEL_ENABLED ? 'Yes (/panel)' : 'No'}`);
 console.log(`  - Use Isolated Home: ${finalConfig.USE_ISOLATED_HOME ? 'Yes' : 'No'}`);
 console.log(`  - Request Timeout: ${finalConfig.REQUEST_TIMEOUT_MS}ms`);
 console.log(`  - Omit System Prompt: ${finalConfig.OMIT_SYSTEM_PROMPT ? 'Yes' : 'No'}`);

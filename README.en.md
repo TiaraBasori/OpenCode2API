@@ -18,6 +18,7 @@ Turns a local [OpenCode](https://opencode.ai) runtime into an OpenAI-compatible 
 - **External tool bridge** — client-supplied `tools` return standard `tool_calls` / `function_call` from the proxy, never touching OpenCode built-in tools
 - **Built-in tool allowlist** — requests without `tools` only allow built-ins listed in `OPENCODE_INTERNAL_ALLOWED_TOOLS`
 - **Observability** — `/health/details` structured diagnostics, `/metrics` Prometheus metrics
+- **Web Panel** — optional built-in dashboard at `/panel` (read-only status/models/diagnostics), off by default
 - **Docker deployment** — one command starts the stack and the OpenCode backend
 
 ## 🚀 Quick Start
@@ -160,6 +161,7 @@ The response contains a `{"type":"tool_use","id":"…","name":"web_fetch","input
 | `OPENCODE_PROXY_OMIT_SYSTEM_PROMPT` | `false` | Ignore the incoming system prompt |
 | `OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS` | `false` | Auto-clean session storage |
 | `OPENCODE_USE_ISOLATED_HOME` | `false` | Use an isolated OpenCode config directory |
+| `OPENCODE_WEB_PANEL_ENABLED` | `false` | Serve the built-in Web Panel at `/panel` |
 | `OPENCODE_PROXY_DEBUG` | `false` | Debug logging |
 
 > 📄 Full reference: [Configuration](./docs/en/configuration.md)
@@ -182,6 +184,8 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 | `GET` | `/health` | Health check |
 | `GET` | `/health/details` | Structured diagnostics (toggle/auth configurable) |
 | `GET` | `/metrics` | Prometheus metrics (toggle/auth configurable) |
+| `GET` | `/panel` | Web Panel page (off by default; enable with `OPENCODE_WEB_PANEL_ENABLED=true`) |
+| `GET` | `/panel/data.json` | Web Panel data feed (Bearer/PUBLIC_DIAGNOSTICS gated, never returns secret values) |
 | `GET` | `/v1/models` | Model list |
 | `POST` | `/v1/chat/completions` | Chat Completions |
 | `POST` | `/v1/responses` | Responses API |
@@ -190,6 +194,12 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 Model names: `opencode/big-pickle`, `gpt5-nano` (auto-resolved to `gpt-5-nano`), `opencode/gpt5-nano`.
 
 > 📖 See [API Reference](./docs/en/api-reference.md)
+
+## 🖥️ Web Panel
+
+Set `OPENCODE_WEB_PANEL_ENABLED=true` (or `"WEB_PANEL_ENABLED": true` in config.json) and open `http://127.0.0.1:10000/panel` in a browser for a read-only dashboard: runtime status (status/uptime/backend URL), the model list, and backend diagnostics (tool-mode counters, cache state). Dark theme, zero external dependencies — no external CSS/JS, CSP locked to same-origin.
+
+With `API_KEY` configured, enter the proxy key in the page (kept in the browser's localStorage and used to call `/panel/data.json`); with `PUBLIC_DIAGNOSTICS=true` or no `API_KEY` no key is needed. When the panel is disabled both routes return 404, and the data feed never returns any secret values. See [Configuration](./docs/en/configuration.md).
 
 ## 🔧 Troubleshooting
 
@@ -217,5 +227,5 @@ MIT · see [LICENSE](./LICENSE.md)
 ## 🙏 Acknowledgements
 
 - [dxxzst/opencode-to-openai](https://github.com/dxxzst/opencode-to-openai)
-- [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) — the same-named Go gateway
+- [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api)
 - [lucasliet/opencode-openai-proxy](https://github.com/lucasliet/opencode-openai-proxy)
