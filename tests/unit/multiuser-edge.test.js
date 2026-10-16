@@ -61,6 +61,7 @@ const okSession = () => {
     sdkMocks.configProviders.mockResolvedValue({ data: { providers: [{ id: 'opencode', models: { m: { name: 'm' } } }] } });
     sdkMocks.sessionCreate.mockResolvedValue({ data: { id: 'ses_x' } });
     sdkMocks.configUpdate.mockResolvedValue({ data: {} });
+    sdkMocks.sessionPrompt.mockResolvedValue({ data: { parts: [{ type: 'text', text: 'hello' }] } });
     sdkMocks.sessionMessages.mockResolvedValue({
         data: [{ info: { role: 'assistant', finish: 'stop' }, parts: [{ type: 'text', text: 'hello' }] }]
     });
