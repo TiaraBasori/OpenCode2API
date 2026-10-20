@@ -13,9 +13,35 @@
 // jailed to the backend project dir so allowed file tools cannot escape it.
 // Unknown allowlist names are ignored (never emitted) to stay schema-valid
 // per https://opencode.ai/config.json (PermissionConfig keys).
+//
+// Free-tier gate: OpenCode's Permission.disabled() (used by resolveTools())
+// runs findLast over the permission rules, matching the TOOL NAME only, then
+// checks whether that selected rule's pattern is `*` with action `deny`. A
+// final `*: deny` therefore hides `read`; hiding it drops `read` from the
+// upstream tools[] and Zen free tier answers 403 FreeTierError. `read` thus
+// emits an ordered rule object ({ "*": deny, [FREE_TIER_READ_GATE_PATH]:
+// allow }) whose selected (last) rule is the non-wildcard sentinel allow, so
+// the tool-name check does not disable `read`. Execution-time path matching is
+// separate: it evaluates the actual path, which matches only the leading
+// `*: deny`, so every real path is denied. The sentinel is NUL-terminated: no
+// real file path can contain NUL, so no real read path can match it, even
+// after OpenCode's Wildcard.match normalizes backslashes to slashes (which
+// would otherwise let a workspace file named
+// `\__opencode_free_tier_gate_never__` collide with a bare absolute sentinel).
+// The sentinel is an upstream free-tier gate token, NOT a real permission
+// grant; explicit `read` opt-in still emits "allow". Do not "simplify" it
+// back to "deny".
 
 /** Backend project dir inside the container (session working scope). */
 export const BACKEND_PROJECT_DIR = '/home/node/project';
+
+/** NUL-terminated sentinel rule path for the free-tier `read` gate (see
+ * header). No real file path can contain NUL, so no actual read path can
+ * match it, including after OpenCode's Wildcard.match backslash-to-slash
+ * normalization. It only keeps `read` visible to OpenCode's findLast-based
+ * permission filter so the upstream tools[] carries `read`. This is not a
+ * permission grant. */
+export const FREE_TIER_READ_GATE_PATH = '/__opencode_free_tier_gate_never__\u0000';
 
 /** Schema-valid opencode permission keys (PermissionConfig). Flat-action keys
  * (todowrite/question/webfetch/websearch/doom_loop) take a bare
@@ -82,6 +108,15 @@ export function buildBackendPermission(
   for (const key of BACKEND_PERMISSION_TOOL_KEYS) {
     if (key === 'external_directory') {
       permission[key] = { [`${scope}/**`]: 'allow', '*': 'deny' };
+    } else if (key === 'read' && !allowed.has(key)) {
+      // Permission.disabled() runs findLast against the tool name only, then
+      // checks the selected rule's pattern: a final `*: deny` hides `read`.
+      // The NUL-terminated sentinel allow must stay last so the selected rule
+      // is not `*`. Execution-time path matching is separate and still denies
+      // every real path via the leading `*: deny` (no real path contains NUL,
+      // so none can match the sentinel). Do not replace this with 'deny'
+      // (re-breaks Zen free tier) or 'allow' (real read execution).
+      permission[key] = { '*': 'deny', [FREE_TIER_READ_GATE_PATH]: 'allow' };
     } else {
       permission[key] = allowed.has(key) ? 'allow' : 'deny';
     }

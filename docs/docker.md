@@ -78,6 +78,46 @@ OPENCODE_PROXY_AUTO_CLEANUP_CONVERSATIONS=true
 docker build -t my-opencode2api .
 ```
 
+### 固定 OpenCode 后端版本
+
+镜像默认安装 `opencode-ai@1.18.35`（由 Dockerfile 的 `ARG OPENCODE_VERSION` 控制）。这个版本是有意固定的：Zen 免费层的 `read` 闸门依赖 OpenCode `Permission.disabled()` 的 findLast 语义——它先按工具名选出最后一条规则，再检查该规则的 pattern 是否为 `*`。不指定版本的 npm `latest`（例如 `npm install -g opencode-ai`）可能悄悄改变该行为，让免费层 403 修复重新失效。需要 Zen 免费层修复时，不要使用不指定版本安装的镜像。
+
+构建时覆盖版本：
+
+```bash
+docker build --build-arg OPENCODE_VERSION=1.18.35 -t my-opencode2api .
+```
+
+`docker compose build` 默认使用 Dockerfile 里的版本；要覆盖需在 `docker-compose.yml`（或 override 文件）的 `build.args` 中传 `OPENCODE_VERSION`：
+
+```yaml
+services:
+  opencode2api:
+    build:
+      args:
+        OPENCODE_VERSION: "1.18.35"
+```
+
+也可以一次性覆盖（无需改 compose 文件）：
+
+```bash
+docker compose build --build-arg OPENCODE_VERSION=1.18.35 opencode2api
+```
+
+修改 `build.args` 不会让 `docker compose up -d` 自动重建镜像；需要先构建再强制重建容器：
+
+```bash
+docker compose build opencode2api
+docker compose up -d --force-recreate
+```
+
+升级固定版本时，代理侧单测只能保护代理侧契约，无法执行镜像里安装的后端。合并前必须完成：
+
+1. 同步更新 `Dockerfile` 的 `ARG OPENCODE_VERSION`、`tests/dockerfile-pin.test.js` 的 `PINNED_VERSION`、本页所有版本字符串（含默认说明），以及 `docs/troubleshooting.md` / `AGENTS.md` / `CHANGELOG.md` 中当前 pin 的版本引用；
+2. 重跑 `tests/free-tier-gate.test.js`、`tests/backend-permission.test.js` 与 `tests/dockerfile-pin.test.js`；
+3. 检查目标版本源码，确认 `Permission.disabled()` 仍使用 `findLast`，且选择逻辑仍是“按工具名取最后一条规则，再判断该规则 pattern 是否为 `*`”；
+4. 用真实后端与 Zen 请求验证 `read` 仍出现在上游 `tools[]` 中，然后再合并。
+
 ### 运行单个容器
 
 ```bash

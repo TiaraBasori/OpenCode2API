@@ -118,7 +118,26 @@ curl -H "Authorization: Bearer YOUR_API_KEY" ...
 
 ---
 
-### 9️⃣ 跨协议转换结果异常
+### 9️⃣ Zen 免费层 403（FreeTierError）
+
+| 项目 | 说明 |
+|:-----|:-----|
+| **症状** | 请求返回 HTTP `403`，客户端可见的 `type`/`code` 为 `permission_denied`；上游响应/日志中含 `FreeTierError`。上游消息为 `OpenCode's free tier can only be used from within OpenCode. Download it at https://opencode.ai and keep building.` |
+| **原因** | 代理侧已知两类原因：(a) 上游请求 `tools[]` 缺少 `read`（headless deny-all 或旧版/未固定版本的后端会隐藏它）；(b) 免费层模型的 prompt `tools` **map** 中出现任何 `false` 条目（代理会为疑似免费模型剥离这些条目，但自定义/旧路径可能漏掉）。若两者均已排除，403 也可能是上游 Zen 的账号资格/网络/出口 IP 拒绝，代理无法修复。 |
+
+排查/修复清单：
+
+1. 升级并重建到当前镜像（后端固定 `opencode-ai@1.18.35`）或当前源码；使用 compose 时执行 `docker compose build`，再 `docker compose up -d --force-recreate`（只改 `build.args` 不会让 `up -d` 自动重建）。
+2. 保持 `DISABLE_TOOLS=true`（默认）。不要仅为通过闸门把 `read` 加入 `OPENCODE_INTERNAL_ALLOWED_TOOLS`——那会授予真实的后端读取执行权限。
+3. 客户端工具按正常请求 `tools` 发送；代理会把它们桥接为 `external__*`，不会注册成后端内置工具。
+4. 默认容器每次启动都会重新生成 `/home/node/.config/opencode/opencode.json`（生成的 `permission` 就在其中）；实际可能覆盖它的是项目级 `/home/node/project/config.json`。若该文件设置了冲突的 `permission.read` deny（字符串或对象形式），删除该 deny；**不要**把它改成 `"allow"`。重建后确认生成的 `read` 闸门仍在。
+5. 若使用自定义或未固定版本的后端，确认其 `Permission.disabled()` 仍使用 `findLast`，且 `read` 仍出现在上游 `tools[]` 中；版本升级检查见 [docs/docker.md](./docker.md) 的「固定 OpenCode 后端版本」。
+
+> 该闸门只保证 `read` 出现在上游 `tools[]` 中，不保证 Zen 免费额度可用；额度限制仍可能以其他错误返回。
+
+---
+
+### 🔟 跨协议转换结果异常
 
 | 项目 | 说明 |
 |:-----|:-----|

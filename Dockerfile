@@ -27,7 +27,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && gosu --version \
     && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g opencode-ai
+# Pin the bundled backend: the Zen free-tier read gate relies on the
+# Permission.disabled() findLast semantics verified against this version.
+# Bumping requires both proxy-side regression tests and a live check that the
+# target version's Permission.disabled()/upstream tools[] behavior still holds.
+ARG OPENCODE_VERSION=1.18.35
+RUN test -n "${OPENCODE_VERSION}" && npm install -g "opencode-ai@${OPENCODE_VERSION}"
 
 RUN mkdir -p /home/node/.local/share/opencode \
     && mkdir -p /home/node/.config/opencode \

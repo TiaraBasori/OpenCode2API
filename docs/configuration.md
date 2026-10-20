@@ -241,7 +241,10 @@ OpenCode2API 现在支持把外部客户端传入的 OpenAI-compatible `tools` �
 - 默认 deny-all；只放行 `OPENCODE_INTERNAL_ALLOWED_TOOLS` 明确列出的工具（`web_fetch` 等别名归一；未知名忽略，不会写坏 schema）。
 - 未显式配置 allowlist 时 `OPENCODE_INTERNAL_WEB_FETCH_ENABLED=true` 沿用旧兼容：放行 `webfetch`。
 - `external_directory` 永远 jail 在 `/home/node/project/**`，之外一律 deny（快速失败，不会 hang；模型转而走外部桥接，由客户端执行并经用户确认）。
-- 空 allowlist = 后端零执行（与“全部内置禁用”安全模式一致）。
+- `read` 是默认规则中的惰性闸门例外：只要 allowlist 未显式放行 `read`（包括配置了其他 allowlist 时），它写成一个**有序惰性闸门对象** `{ "*": "deny", "/__opencode_free_tier_gate_never__\u0000": "allow" }`，而不是裸 `deny` 或 `allow`。OpenCode 的 `Permission.disabled()`（供 `resolveTools()` 使用）先按**工具名**对规则做 `findLast`，再检查选中规则的 pattern 是否为 `*`；最后一条非 `*` 的 NUL 哨兵 allow 让按工具名的检查不隐藏 `read`，因此 Zen 免费层要求的上游 `tools[]` 中仍包含 `read`（否则返回 403 `FreeTierError`）。执行期的路径匹配是另一套逻辑：真实路径只会命中开头的 `*: deny`，所以仍然全部拒绝。哨兵以 NUL 结尾，真实文件路径不可能包含 NUL，因此即使 OpenCode 的 `Wildcard.match` 把反斜杠归一成斜杠，也不会有真实路径命中哨兵。该哨兵只是上游免费层闸门 token，**不是执行权限**；显式在 allowlist 中写 `read` 才会恢复真正的 `allow`。
+- `bash` 默认仍是 `deny`；不要为了“通过闸门”把 `read` 或 `bash` 设为 `allow`（前者打开真实后端读取，后者打开命令执行）。
+- 空 allowlist 且未启用 `OPENCODE_INTERNAL_WEB_FETCH_ENABLED` 兼容开关时 = 后端零真实执行；启用该开关时仅额外放行 `webfetch`。`read` 仅为免费层闸门保持可见，**并未放行**（真实路径仍被拒绝）。
+- 客户端自带 `tools` 时仍走外部桥接（`external__*`），这些工具从不会注册成后端内置工具，因此上述 `read` 闸门不影响客户端侧的工具执行。
 
 ### 请求级 allowlist 覆盖 (Request-Level Override)
 

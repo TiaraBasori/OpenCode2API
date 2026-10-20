@@ -68,8 +68,10 @@ import('./dist/src/backend/backend-permission.js').then((m) => {
 }).catch((e) => { console.error(String(e && e.message || e)); process.exit(1); });" 2>/dev/null) || BACKEND_PERM_JSON=""
 fi
 if [ -z "$BACKEND_PERM_JSON" ]; then
-    echo "[Config] Warning: backend permission generator unavailable; using static deny-all fallback" >&2
-    BACKEND_PERM_JSON='{"read":"deny","edit":"deny","glob":"deny","grep":"deny","list":"deny","bash":"deny","task":"deny","todowrite":"deny","question":"deny","webfetch":"deny","websearch":"deny","lsp":"deny","doom_loop":"deny","skill":"deny","external_directory":{"/home/node/project/**":"allow","*":"deny"}}'
+    # Safety mirror of buildBackendPermission() with no allowlist; guarded
+    # against drift by tests/backend-permission.test.js.
+    echo "[Config] Warning: backend permission generator unavailable; using static deny-all-execution fallback" >&2
+    BACKEND_PERM_JSON='{"read":{"*":"deny","/__opencode_free_tier_gate_never__\u0000":"allow"},"edit":"deny","glob":"deny","grep":"deny","list":"deny","bash":"deny","task":"deny","todowrite":"deny","question":"deny","webfetch":"deny","websearch":"deny","lsp":"deny","doom_loop":"deny","skill":"deny","external_directory":{"/home/node/project/**":"allow","*":"deny"}}'
 fi
 PLUGIN_JSON_LINE=""
 if [[ "${OPENCODE_PROXY_PROMPT_MODE:-standard}" == "plugin-inject" ]]; then
