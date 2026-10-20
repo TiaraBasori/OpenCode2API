@@ -496,6 +496,36 @@ function usageFromInfo(info) {
     };
 }
 
+/**
+ * Honour the backend's `Retry-After` when a turn was throttled: it is the only
+ * figure that reflects the provider's actual window. Returns milliseconds, or
+ * null when the response carried no usable header. Accepts both forms of the
+ * header (delta-seconds and HTTP-date).
+ */
+function retryAfterMs(response) {
+    const raw = response?.headers?.get?.('retry-after');
+    if (!raw) return null;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    const at = Date.parse(raw);
+    if (Number.isFinite(at)) return Math.max(0, at - Date.now());
+    return null;
+}
+
+/**
+ * Delay before retry `attempt` (1-based):
+ *  - `Retry-After` from the throttling response, when there is one;
+ *  - otherwise exponential backoff: base, 2×base, 4×base, ...
+ * Capped so a hostile or wrong header cannot park a request for hours.
+ */
+const RETRY_BACKOFF_MAX_MS = 120000;
+
+function retryDelayMs({ attempt, response = null, baseMs = RETRY_BACKOFF_BASE_MS }) {
+    const fromHeader = retryAfterMs(response);
+    const delay = fromHeader !== null ? fromHeader : baseMs * (2 ** Math.max(0, attempt - 1));
+    return Math.min(delay, RETRY_BACKOFF_MAX_MS);
+}
+
 // --- Mutex Logic with Timeout ---
 async function getImageDataUri(url) {
     if (url.startsWith('data:')) {
@@ -2591,6 +2621,8 @@ export function createApp(config) {
 
                         let collected = null;
                         let streamToolCallsSeen = false;
+                        // Error from the previous attempt, kept for its Retry-After.
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session: the failed attempt left an errored
@@ -2613,7 +2645,8 @@ export function createApp(config) {
                                 streamedToolCalls.length = 0;
                                 completionTokens = 0;
                                 reasoningTokens = 0;
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                // Throttling responses carry the provider's own window.
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             try {
                                 const collectPromise = collectFromEvents(
@@ -2637,6 +2670,7 @@ export function createApp(config) {
                             if (clientGone) break;
 
                             const attemptError = collected?.error || collected?.__error || null;
+                            lastAttemptError = attemptError;
                             const nothingStreamed = !rawStreamedContent
                                 && !rawStreamedReasoning
                                 && streamedToolCalls.length === 0;
@@ -2841,6 +2875,7 @@ export function createApp(config) {
                         let content = '';
                         let reasoning = '';
                         let error = null;
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session: the failed attempt left an errored
@@ -2855,7 +2890,7 @@ export function createApp(config) {
                                 sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
                                 requestForcedChatToolCall = makeForcedChatToolCallRequester();
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             if (clientGone) break;
                             const attemptStart = Date.now();
@@ -2865,6 +2900,7 @@ export function createApp(config) {
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
                             error = collected.error || null;
+                            lastAttemptError = error;
                             if (collected.usage) reportedUsage = collected.usage;
                             // Bounded retry for upstream throttling mislabeled as billing
                             // errors (401 CreditsError etc.); only when nothing usable was
@@ -3478,6 +3514,8 @@ export function createApp(config) {
                         };
 
                         let collected = null;
+                        // Error from the previous attempt, kept for its Retry-After.
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session (same rationale as chat completions).
@@ -3496,7 +3534,7 @@ export function createApp(config) {
                                 streamedToolCalls.length = 0;
                                 completionTokens = 0;
                                 reasoningTokens = 0;
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             try {
                                 const collectPromise = collectFromEvents(
@@ -3520,6 +3558,7 @@ export function createApp(config) {
                             if (clientGone) break;
 
                             const attemptError = collected?.error || collected?.__error || null;
+                            lastAttemptError = attemptError;
                             const nothingStreamed = !rawStreamedContent
                                 && !rawStreamedReasoning
                                 && streamedToolCalls.length === 0;
@@ -3724,6 +3763,7 @@ export function createApp(config) {
                         let content = '';
                         let reasoning = '';
                         let error = null;
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session (same rationale as chat completions).
@@ -3735,7 +3775,7 @@ export function createApp(config) {
                                 sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
                                 requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             if (clientGone) break;
                             await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
@@ -3743,6 +3783,7 @@ export function createApp(config) {
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
                             error = collected.error || null;
+                            lastAttemptError = error;
                             if (collected.usage) reportedUsage = collected.usage;
                             if (
                                 error
