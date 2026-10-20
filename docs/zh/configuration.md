@@ -39,6 +39,9 @@
 | `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `CLEANUP_INTERVAL_MS` | `43200000` | 清理间隔（毫秒） |
 | `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `CLEANUP_MAX_AGE_MS` | `86400000` | 会话最大保留时间（毫秒） |
 | `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `REQUEST_TIMEOUT_MS` | `180000` | 请求超时（毫秒） |
+| `OPENCODE_USAGE_FILE` | `USAGE_FILE` | `config.json` 同目录的 `usage.json` | 按 key 用量快照路径（仅多用户模式） |
+| `OPENCODE_USAGE_PERSISTENCE` | `USAGE_PERSISTENCE` | `true` | 是否跨重启保留按 key 计数 |
+| `OPENCODE_USAGE_SAVE_INTERVAL_MS` | `USAGE_SAVE_INTERVAL_MS` | `300000` | 快照重写间隔（毫秒）；`0` 表示只在关机时写 |
 
 ### 诊断与调试
 
@@ -180,11 +183,23 @@ config.json 顶层使用 `API_KEYS` 数组，每项 `{name, key}`（`name` 可�
 
 ### 用量口径
 
-用量保存在内存中，随进程重启清零（不做持久化）：
+用量在内存中累计，多用户部署下同时写入磁盘，重启不清零：
 
-- **requests**：认证通过后进入业务 handler 的请求数（`/v1/chat/completions`、`/v1/responses`），失败的请求（4xx/5xx）同样计入；
-- **promptTokens / completionTokens**：仅成功请求累计，沿用 `Math.ceil(字符数 / 4)` 的估算口径，completionTokens 包含 reasoning tokens（与响应 usage 字段一致）；
+- **requests**：认证通过后进入业务 handler 的请求数（`/v1/chat/completions`、`/v1/messages`、`/v1/responses`），失败的请求（4xx/5xx）同样计入；
+- **promptTokens / completionTokens**：仅成功请求累计。后端每一轮都会返回自己统计的 token 数，因此以它为准；`Math.ceil(字符数 / 4)` 只在后端未回报时兜底。promptTokens 包含命中的缓存 token，completionTokens 包含 reasoning tokens；
 - **lastUsedAt / createdAt**：最后一次使用时间与 key 创建（进程启动或运行时新增）时间的毫秒时间戳。
+
+#### 跨重启保留计数
+
+配置了 `API_KEYS` 时，计数每五分钟写入 `config.json` 同目录下的 `usage.json`，并在收到 `SIGINT`/`SIGTERM` 时再写一次。写入采用原子替换（临时文件 + rename），文件权限 `0600`；文件损坏只告警并忽略，不会阻塞启动。启动时恢复已保存的计数，因此重启或重新部署都不会清零。
+
+| 环境变量 | 配置项 | 默认值 | 说明 |
+|:-----|:-----|:-----|:-----|
+| `OPENCODE_USAGE_PERSISTENCE` | `USAGE_PERSISTENCE` | `true` | 是否把按 key 计数写入磁盘；`false` 恢复原先仅内存的行为 |
+| `OPENCODE_USAGE_FILE` | `USAGE_FILE` | `config.json` 同目录的 `usage.json` | 快照路径 |
+| `OPENCODE_USAGE_SAVE_INTERVAL_MS` | `USAGE_SAVE_INTERVAL_MS` | `300000` | 重写快照的间隔；`0` 关闭周期写入（关机时仍会写一次） |
+
+需要清零时，停止代理后删除 `usage.json`。单 key 部署（未配置 `API_KEYS`）不保留按 key 状态，也不会写这个文件。
 
 `/health/details` 在多用户模式下额外返回 `usage` 字段（单 key 部署不出现，保持兼容）：
 

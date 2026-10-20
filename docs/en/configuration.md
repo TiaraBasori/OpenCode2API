@@ -39,6 +39,9 @@ Env vars use the `OPENCODE_` prefix; config.json uses the short names (see table
 | `OPENCODE_PROXY_CLEANUP_INTERVAL_MS` | `CLEANUP_INTERVAL_MS` | `43200000` | Cleanup interval (ms) |
 | `OPENCODE_PROXY_CLEANUP_MAX_AGE_MS` | `CLEANUP_MAX_AGE_MS` | `86400000` | Max session age (ms) |
 | `OPENCODE_PROXY_REQUEST_TIMEOUT_MS` | `REQUEST_TIMEOUT_MS` | `180000` | Request timeout (ms) |
+| `OPENCODE_USAGE_FILE` | `USAGE_FILE` | `usage.json` beside `config.json` | Per-key usage snapshot path (multi-user only) |
+| `OPENCODE_USAGE_PERSISTENCE` | `USAGE_PERSISTENCE` | `true` | Keep per-key counters across restarts |
+| `OPENCODE_USAGE_SAVE_INTERVAL_MS` | `USAGE_SAVE_INTERVAL_MS` | `300000` | Snapshot rewrite interval (ms); `0` = shutdown save only |
 
 ### Diagnostics & Debug
 
@@ -180,11 +183,23 @@ Mounted only when at least one `API_KEYS` entry is configured. Every endpoint re
 
 ### Usage accounting
 
-Usage lives in memory and resets on process restart (no persistence, by design):
+Usage is counted in memory and, on multi-user deployments, also saved to disk so counters survive a restart:
 
-- **requests**: requests that authenticated and entered a business handler (`/v1/chat/completions`, `/v1/responses`); failed requests (4xx/5xx) also count;
-- **promptTokens / completionTokens**: accumulated for successful requests only, using the same `Math.ceil(chars / 4)` estimation as the response usage field; completionTokens include reasoning tokens;
+- **requests**: requests that authenticated and entered a business handler (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`); failed requests (4xx/5xx) also count;
+- **promptTokens / completionTokens**: accumulated for successful requests. The backend reports its own token counts for every turn, so those are what gets billed; the `Math.ceil(chars / 4)` estimate is only a fallback for a backend that reports none. Cached prompt tokens are included in promptTokens, and completionTokens include reasoning tokens;
 - **lastUsedAt / createdAt**: millisecond timestamps of the last use and of key creation (process start or runtime add).
+
+#### Keeping the counters across restarts
+
+With `API_KEYS` configured, the counters are written to `usage.json` next to `config.json` every five minutes and once more on `SIGINT`/`SIGTERM`. The file is written atomically (temp file + rename) with mode `0600`, and a damaged file is reported and ignored instead of blocking startup. On start the saved counters are restored, so a restart — or a redeploy — does not reset them.
+
+| Variable | Config key | Default | Description |
+|:-----|:-----|:-----|:-----|
+| `OPENCODE_USAGE_PERSISTENCE` | `USAGE_PERSISTENCE` | `true` | Save per-key counters to disk. `false` restores the old in-memory-only behavior |
+| `OPENCODE_USAGE_FILE` | `USAGE_FILE` | `usage.json` next to `config.json` | Snapshot path |
+| `OPENCODE_USAGE_SAVE_INTERVAL_MS` | `USAGE_SAVE_INTERVAL_MS` | `300000` | How often the snapshot is rewritten; `0` disables periodic saves (the shutdown save still runs) |
+
+To reset the counters, stop the proxy and delete `usage.json`. Single-key deployments (no `API_KEYS`) keep no per-key state and never write the file.
 
 `/health/details` gains a `usage` field in multi-user mode (absent for single-key deployments, preserving the legacy snapshot shape):
 
