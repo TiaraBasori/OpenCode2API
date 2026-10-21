@@ -527,6 +527,17 @@ function retryDelayMs({ attempt, response = null, baseMs = RETRY_BACKOFF_BASE_MS
 }
 
 // --- Mutex Logic with Timeout ---
+/**
+ * The failure carried by a `session.prompt` result, or null when the turn was
+ * accepted. The SDK resolves (rather than rejects) for a non-2xx backend
+ * response, so callers must look at `error` as well as at a rejection.
+ */
+function promptErrorOf(result) {
+    if (!result || !result.error) return null;
+    return result.error.info?.error || result.error;
+}
+
+// --- Mutex Logic with Timeout ---
 async function getImageDataUri(url) {
     if (url.startsWith('data:')) {
         return url;
@@ -1633,6 +1644,7 @@ export function createApp(config) {
         if (!entry || entry.sessionId !== sessionId) return;
         entry.userTurns = userTurns;
         entry.pending = false;
+        entry.failed = false;
         entry.expiresAt = Date.now() + CHAT_SESSION_TTL_MS;
         chatSessionActive.delete(sessionId);
     };
@@ -1721,7 +1733,12 @@ export function createApp(config) {
         const timeoutPromise = new Promise((_, reject) => {
             setTimeout(() => reject(new Error(`Request timeout after ${timeoutMs}ms`)), timeoutMs);
         });
-        return Promise.race([client.session.prompt(promptParams), timeoutPromise]);
+        const result = await Promise.race([client.session.prompt(promptParams), timeoutPromise]);
+        // The SDK resolves for a non-2xx backend response; treat that as the
+        // failure it is instead of polling for a reply that will never appear.
+        const failure = promptErrorOf(result);
+        if (failure) throw failure;
+        return result;
     }
 
     const getCleanupRoots = () => {
@@ -1885,7 +1902,7 @@ export function createApp(config) {
      * @returns {Promise<object>} `{content, reasoning, usage?, error?}`
      */
     async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs, options = {}) {
-        const { signal: clientSignal = null, onUsage = null } = options;
+        const { signal: clientSignal = null, onUsage = null, promptFailure = null } = options;
         const controller = new AbortController();
         const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
         const eventStream = eventStreamResult.stream;
@@ -2041,6 +2058,36 @@ export function createApp(config) {
                 }
                 deltaChars += delta.length;
             };
+
+            // A prompt call that fails never produces an event, so waiting for one
+            // means waiting out the whole window while the caller sees keepalives.
+            // The SDK reports a failed turn either by rejecting or by resolving with
+            // `{ error }` (a non-2xx from the backend), so both count. A resolved
+            // prompt keeps the collector waiting for the events it will produce.
+            if (promptFailure) {
+                const endOnPromptError = (err) => {
+                    if (finished) return;
+                    finished = true;
+                    clearTimeout(timeoutId);
+                    if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
+                    if (idleTimer) clearTimeout(idleTimer);
+                    releaseClientSignal();
+                    controller.abort();
+                    logDebug('Prompt call failed, ending turn', {
+                        sessionId,
+                        ms: Date.now() - startedAt,
+                        error: err?.message || String(err)
+                    });
+                    resolve({ content, reasoning, usage: reportedUsage, __error: err, promptFailed: true });
+                };
+                promptFailure.then(
+                    (result) => {
+                        const err = promptErrorOf(result);
+                        if (err) endOnPromptError(err);
+                    },
+                    endOnPromptError
+                );
+            }
 
             (async () => {
                 try {
@@ -2447,7 +2494,10 @@ export function createApp(config) {
                         signal = chatSessionSignalOf(req, req.body);
                         if (signal) {
                             const entry = chatSessions.get(signal);
-                            if (entry && entry.expiresAt > Date.now() && !entry.pending
+                            // A turn that ended on a provider error leaves an errored
+                            // message in the session; resuming it would replay that error
+                            // on every later turn of the conversation.
+                            if (entry && !entry.failed && entry.expiresAt > Date.now() && !entry.pending
                                 && entry.model === `${pID}/${mID}`
                                 && entry.system === (systemWithGuard || '')
                                 && entry.toolPolicy === toolControl.title
@@ -2562,6 +2612,24 @@ export function createApp(config) {
                         };
                         ensureKeepalive();
 
+                        // Errors are not model output: send them as their own chunk
+                        // instead of pushing them through the content filter, which can
+                        // legitimately hold or strip text.
+                        const sendStreamError = (failure) => {
+                            if (res.destroyed) return;
+                            res.write(`data: ${JSON.stringify({
+                                id,
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: `${pID}/${mID}`,
+                                choices: [{
+                                    index: 0,
+                                    delta: { content: `\n\n[Proxy Error] ${failure?.name || 'OpenCodeError'}: ${failure?.data?.message || failure?.message || 'upstream request failed'}` },
+                                    finish_reason: null
+                                }]
+                            })}\n\n`);
+                        };
+
                         const sendDelta = (delta, isReasoning = false) => {
                             if (!delta) return;
                             if (isReasoning) rawStreamedReasoning += delta;
@@ -2649,6 +2717,8 @@ export function createApp(config) {
                                 await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             try {
+                                const promptCall = client.session.prompt(promptParams);
+                                promptCall.catch((err) => logDebug('Prompt error:', err.message));
                                 const collectPromise = collectFromEvents(
                                     sessionId,
                                     REQUEST_TIMEOUT_MS,
@@ -2657,10 +2727,13 @@ export function createApp(config) {
                                     EVENT_IDLE_TIMEOUT_MS,
                                     {
                                         signal: clientAbort.signal,
-                                        onUsage: (usage) => { reportedUsage = usage; }
+                                        onUsage: (usage) => { reportedUsage = usage; },
+                                        promptFailure: promptCall
                                     }
                                 );
                                 const safeCollect = collectPromise.catch((err) => ({ __error: err }));
+                                // The collector watches this promise, so a prompt that fails
+                                // ends the turn instead of waiting out its window.
                                 client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
                                 collected = await safeCollect;
                             } catch (e) {
@@ -2689,7 +2762,11 @@ export function createApp(config) {
                         // Every fallback below re-reads the session through polling.
                         // With the caller gone there is nobody to stream to and the
                         // turn was aborted, so re-running it would be pure cost.
-                        if (collected && collected.__error && !clientGone) {
+                        // A prompt that failed leaves nothing to poll for: the turn never
+                        // started, so the polling fallback would only wait out its window
+                        // and then report an empty result.
+                        const noTurnToPoll = Boolean(collected && collected.promptFailed);
+                        if (collected && collected.__error && !clientGone && !noTurnToPoll) {
                             logDebug('SSE collect error, falling back to polling', {
                                 sessionId,
                                 error: collected.__error?.message
@@ -2738,7 +2815,7 @@ export function createApp(config) {
                             if (collected.content) sendDelta(collected.content, false);
                         }
 
-                        if (!streamedContent && !streamedReasoning && !clientGone) {
+                        if (!streamedContent && !streamedReasoning && !clientGone && !noTurnToPoll) {
                             logDebug('SSE returned empty, falling back to polling', { sessionId });
                             const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                             if (polled.usage) reportedUsage = polled.usage;
@@ -2836,7 +2913,12 @@ export function createApp(config) {
                             return;
                         }
 
-                        if (affinitySignal && !streamToolCallsSeen) {
+                        if (noTurnToPoll) {
+                            // The turn never started: report it on the open stream, then
+                            // drop the mapping so the next request starts a clean session.
+                            sendStreamError(collected.__error);
+                            if (affinitySignal) await chatSessionEntryFail(affinitySignal, sessionId);
+                        } else if (affinitySignal && !streamToolCallsSeen) {
                             chatSessionEntryComplete(affinitySignal, sessionId, [...(reuseUserTurns || []), lastUserMsg]);
                         } else if (affinitySignal) {
                             chatSessionEntryFail(affinitySignal, sessionId);
@@ -2894,7 +2976,21 @@ export function createApp(config) {
                             }
                             if (clientGone) break;
                             const attemptStart = Date.now();
-                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            // A rejected prompt means the turn never started; polling for
+                            // it would wait out the whole request timeout first.
+                            try {
+                                await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            } catch (promptError) {
+                                if (clientGone) break;
+                                const failure = promptErrorOf(promptError) || promptError;
+                                error = failure;
+                                lastAttemptError = failure;
+                                if (attempt < RETRY_MAX_ATTEMPTS && isTransientUpstreamError(failure)) {
+                                    console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, failure.data?.message || failure.message || failure.name || 'unknown');
+                                    continue;
+                                }
+                                break;
+                            }
                             logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
                             const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                             content = collected.content || '';
@@ -3537,6 +3633,8 @@ export function createApp(config) {
                                 await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             try {
+                                const promptCall = client.session.prompt(promptParams);
+                                promptCall.catch((err) => logDebug('Prompt error:', err.message));
                                 const collectPromise = collectFromEvents(
                                     sessionId,
                                     REQUEST_TIMEOUT_MS,
@@ -3545,10 +3643,13 @@ export function createApp(config) {
                                     EVENT_IDLE_TIMEOUT_MS,
                                     {
                                         signal: clientAbort.signal,
-                                        onUsage: (usage) => { reportedUsage = usage; }
+                                        onUsage: (usage) => { reportedUsage = usage; },
+                                        promptFailure: promptCall
                                     }
                                 );
                                 const safeCollect = collectPromise.catch((err) => ({ __error: err }));
+                                // The collector watches this promise, so a prompt that fails
+                                // ends the turn instead of waiting out its window.
                                 client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
                                 collected = await safeCollect;
                             } catch (e) {
@@ -3778,7 +3879,21 @@ export function createApp(config) {
                                 await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             if (clientGone) break;
-                            await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            // See the Chat handler: a rejected prompt ends the attempt
+                            // instead of polling for a reply that cannot appear.
+                            try {
+                                await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
+                            } catch (promptError) {
+                                if (clientGone) break;
+                                const failure = promptErrorOf(promptError) || promptError;
+                                error = failure;
+                                lastAttemptError = failure;
+                                if (attempt < RETRY_MAX_ATTEMPTS && isTransientUpstreamError(failure)) {
+                                    console.warn(`[Proxy] Transient upstream error (attempt ${attempt}/${RETRY_MAX_ATTEMPTS}), retrying:`, failure.data?.message || failure.message || failure.name || 'unknown');
+                                    continue;
+                                }
+                                break;
+                            }
                             const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
@@ -4652,6 +4767,9 @@ export function createApp(config) {
 
                 let collected = null;
                 try {
+                    // See the Chat handler: a prompt that fails ends the turn at once.
+                    const promptCall = client.session.prompt(promptParams);
+                    promptCall.catch(err => logDebug('Responses prompt error:', err.message));
                     const collectPromise = collectFromEvents(
                         sessionId,
                         REQUEST_TIMEOUT_MS,
@@ -4660,11 +4778,11 @@ export function createApp(config) {
                         EVENT_IDLE_TIMEOUT_MS,
                         {
                             signal: clientAbort.signal,
-                            onUsage: (usage) => { reportedUsage = usage; }
+                            onUsage: (usage) => { reportedUsage = usage; },
+                            promptFailure: promptCall
                         }
                     );
                     const safeCollect = collectPromise.catch((err) => ({ __error: err }));
-                    client.session.prompt(promptParams).catch(err => logDebug('Responses prompt error:', err.message));
                     collected = await safeCollect;
                 } catch (e) {
                     collected = { __error: e };
