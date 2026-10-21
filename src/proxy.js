@@ -15,6 +15,7 @@ import { buildExternalToolRegistry, findExternalToolByName } from './tool-runtim
 import { buildToolExposure } from './tool-runtime/router.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
 import { PANEL_CSP, PANEL_HTML } from './panel-page.js';
+import { createUsageStore, defaultUsageFilePath } from './usage-persistence.js';
 import {
     stripFunctionCallMarkup,
     parseExternalToolCallsFromText,
@@ -359,15 +360,20 @@ function escapePrometheusLabel(value) {
 }
 
 /**
- * Create an in-memory per-key usage registry. Entries exist eagerly for
- * configured keys (visible with zeroed counters before first use) and lazily
- * for keys added at runtime. Data lives for the process lifetime only — there
- * is intentionally no persistence.
+ * Create a per-key usage registry. Entries exist eagerly for configured keys
+ * (visible with zeroed counters before first use) and lazily for keys added at
+ * runtime.
+ *
+ * Counters live in memory; an optional `store` (see usage-persistence.js)
+ * lifts them across restarts by restoring them here and writing snapshots on
+ * demand. Without a store the registry is process-lifetime only.
  *
  * @param {Array<{name: string}>} [entries] - initially configured key names
+ * @param {object} [options]
+ * @param {{read: Function, register: Function}} [options.store] - snapshot store
  * @returns {object} registry with trackRequest/trackUsage/entry/snapshot/...
  */
-export function createKeyUsageRegistry(entries = []) {
+export function createKeyUsageRegistry(entries = [], { store = null } = {}) {
     const zeroUsage = (createdAt) => ({
         requests: 0,
         promptTokens: 0,
@@ -385,6 +391,19 @@ export function createKeyUsageRegistry(entries = []) {
         }
         return entry;
     };
+
+    // Restore before configured keys are seeded so a restart continues the
+    // counters instead of zeroing them. A row whose key is no longer
+    // configured is kept rather than dropped: an operator may be mid-rename,
+    // and an admin can still see and delete it.
+    if (store && typeof store.read === 'function') {
+        const restored = store.read() || {};
+        for (const [name, row] of Object.entries(restored)) {
+            if (row && typeof row === 'object') {
+                map.set(name, { ...zeroUsage(row.createdAt || Date.now()), ...row });
+            }
+        }
+    }
     (Array.isArray(entries) ? entries : []).forEach(({ name }) => ensureEntry(name));
 
     const copyEntry = (entry) => ({
@@ -396,7 +415,7 @@ export function createKeyUsageRegistry(entries = []) {
         createdAt: entry.createdAt
     });
 
-    return {
+    const registry = {
         /** True when the name has a usage entry. */
         has: (name) => map.has(name),
         /** Ensure an entry exists (keys added at runtime via the admin API). */
@@ -455,6 +474,56 @@ export function createKeyUsageRegistry(entries = []) {
             return { byKey, total };
         }
     };
+
+    if (store && typeof store.register === 'function') store.register(registry);
+    return registry;
+}
+
+/**
+ * Map the backend's own token counts (`info.tokens`) onto the proxy's usage
+ * shape, or null when the backend did not report any. Cached prompt tokens are
+ * included in the prompt count: providers bill them, and the OpenAI response
+ * shape reports prompt tokens the same way. Reasoning is reported separately
+ * and is also part of the billed completion figure.
+ */
+function usageFromInfo(info) {
+    if (!info || !info.tokens) return null;
+    const count = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+    return {
+        promptTokens: count(info.tokens.input) + count(info.tokens.cache?.read) + count(info.tokens.cache?.write),
+        completionTokens: count(info.tokens.output),
+        reasoningTokens: count(info.tokens.reasoning)
+    };
+}
+
+/**
+ * Honour the backend's `Retry-After` when a turn was throttled: it is the only
+ * figure that reflects the provider's actual window. Returns milliseconds, or
+ * null when the response carried no usable header. Accepts both forms of the
+ * header (delta-seconds and HTTP-date).
+ */
+function retryAfterMs(response) {
+    const raw = response?.headers?.get?.('retry-after');
+    if (!raw) return null;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1000;
+    const at = Date.parse(raw);
+    if (Number.isFinite(at)) return Math.max(0, at - Date.now());
+    return null;
+}
+
+/**
+ * Delay before retry `attempt` (1-based):
+ *  - `Retry-After` from the throttling response, when there is one;
+ *  - otherwise exponential backoff: base, 2×base, 4×base, ...
+ * Capped so a hostile or wrong header cannot park a request for hours.
+ */
+const RETRY_BACKOFF_MAX_MS = 120000;
+
+function retryDelayMs({ attempt, response = null, baseMs = RETRY_BACKOFF_BASE_MS }) {
+    const fromHeader = retryAfterMs(response);
+    const delay = fromHeader !== null ? fromHeader : baseMs * (2 ** Math.max(0, attempt - 1));
+    return Math.min(delay, RETRY_BACKOFF_MAX_MS);
 }
 
 // --- Mutex Logic with Timeout ---
@@ -516,6 +585,8 @@ const RETRY_MAX_ATTEMPTS = 3;
 // every request, which loses true streaming. Configurable for slow backends.
 const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_FIRST_DELTA_TIMEOUT_MS) || 30000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = Number(process.env.OPENCODE2API_EVENT_IDLE_TIMEOUT_MS) || 8000;
+// How often the per-key usage snapshot is rewritten while the proxy runs.
+const DEFAULT_USAGE_SAVE_INTERVAL_MS = 5 * 60 * 1000;
 
 const OPENCODE_BASENAME = 'opencode';
 
@@ -794,19 +865,11 @@ function cleanupTempDirs() {
 // Register cleanup on exit
 process.on('exit', cleanupTempDirs);
 
-// Handle signals - Unix-like systems
-if (process.platform !== 'win32') {
-    process.on('SIGINT', () => {
-        console.log('\n[Shutdown] Received SIGINT, cleaning up...');
-        cleanupTempDirs();
-        process.exit(0);
-    });
-    process.on('SIGTERM', () => {
-        console.log('\n[Shutdown] Received SIGTERM, cleaning up...');
-        cleanupTempDirs();
-        process.exit(0);
-    });
-}
+// Temp-dir cleanup is registered as an `exit` handler only. Do NOT add SIGINT /
+// SIGTERM handlers here: this module is imported by the entry point, which owns
+// the shutdown sequence (flush the usage snapshot, close the server, kill the
+// backend). A handler here would race that one and exit(0) first — the entry
+// point's async flush would never get to run.
 // Note: Windows signal handling is limited, cleanup is handled via process.on('exit')
 
 /**
@@ -833,7 +896,10 @@ export function createApp(config) {
         OPENCODE_HOME_BASE,
         EVENT_IDLE_TIMEOUT_MS = DEFAULT_EVENT_IDLE_TIMEOUT_MS,
         EVENT_FIRST_DELTA_TIMEOUT_MS = DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS,
-        WEB_PANEL_ENABLED = false
+        WEB_PANEL_ENABLED = false,
+        USAGE_PERSISTENCE = false,
+        USAGE_FILE = null,
+        USAGE_SAVE_INTERVAL_MS = DEFAULT_USAGE_SAVE_INTERVAL_MS
     } = config;
 
     // Multi-user keys: parse once at app creation. Duplicate keys/names throw
@@ -851,7 +917,22 @@ export function createApp(config) {
     }
     const apiKeyByName = new Map(apiKeyEntries.map((entry) => [entry.name, entry.key]));
     const multiUserEnabled = apiKeyEntries.length > 0;
-    const keyUsage = createKeyUsageRegistry(apiKeyEntries);
+    // Counters survive a restart only when the caller asked for it: a snapshot
+    // next to the config, written every few minutes and on shutdown. The store
+    // is created first so the registry can restore from it while it is built,
+    // and the registry calls the store's `register` to start periodic saving.
+    // With the flag off there is no store and the registry stays in process
+    // memory, exactly as before.
+    const usageStore = USAGE_PERSISTENCE && USAGE_FILE
+        ? createUsageStore({
+            file: USAGE_FILE,
+            intervalMs: USAGE_SAVE_INTERVAL_MS,
+            log: (message) => console.warn(message)
+        })
+        : null;
+    const keyUsage = createKeyUsageRegistry(apiKeyEntries, { store: usageStore });
+    // Exposed so the shutdown path can write one last snapshot.
+    const persistUsageNow = () => (usageStore ? usageStore.close() : Promise.resolve(false));
 
     const findMatchingUserKeyName = (token) => {
         if (!token || !multiUserEnabled) return null;
@@ -1752,15 +1833,19 @@ export function createApp(config) {
                         if (error) {
                             console.error('[Proxy] OpenCode assistant error:', error);
                         }
+                        // Real counts when the backend finished the message and
+                        // reported them; null tells the caller to estimate.
+                        const usage = usageFromInfo(info);
                         logDebug('Polling completed', {
                             sessionId,
                             ms: Date.now() - pollStart,
                             done,
                             contentLen: content.length,
                             reasoningLen: reasoning.length,
-                            error: error ? error.name : null
+                            error: error ? error.name : null,
+                            realUsage: Boolean(usage)
                         });
-                        return { content, reasoning, error };
+                        return { content, reasoning, usage, error };
                     }
                     if (content || reasoning) {
                         lastPartial = { content, reasoning, error: null };
@@ -1783,7 +1868,24 @@ export function createApp(config) {
         throw new Error(`Request timeout after ${timeoutMs}ms`);
     }
 
-    async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
+    /**
+     * Collect one assistant turn from the backend event stream.
+     *
+     * @param {string} sessionId
+     * @param {number} timeoutMs - whole-turn ceiling
+     * @param {Function} [onDelta] - streaming sink
+     * @param {number} [firstDeltaTimeoutMs] - give up when no delta arrives at all
+     * @param {number} [idleTimeoutMs] - give up when the stream goes silent mid-turn
+     * @param {object} [options]
+     * @param {AbortSignal} [options.signal] - aborts the turn when the client
+     *   goes away; without it a disconnected client keeps the backend busy for
+     *   the whole timeout and blocks the next request in the lock queue.
+     * @param {(usage: {promptTokens: number, completionTokens: number, reasoningTokens: number}) => void} [options.onUsage]
+     *   - called once when the backend reports its own token counts
+     * @returns {Promise<object>} `{content, reasoning, usage?, error?}`
+     */
+    async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs, options = {}) {
+        const { signal: clientSignal = null, onUsage = null } = options;
         const controller = new AbortController();
         const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
         const eventStream = eventStreamResult.stream;
@@ -1793,6 +1895,9 @@ export function createApp(config) {
         let receivedDelta = false;
         let deltaChars = 0;
         let firstDeltaAt = null;
+        // The backend reports real token counts on the finished assistant
+        // message; estimate only when it never does.
+        let reportedUsage = null;
         // Tracks internal OpenCode tool calls that are still pending/running. While any
         // tool call is active, the stream must stay open even if no text deltas arrive
         // (the backend is executing the tool). Resolving early here is what previously
@@ -1808,13 +1913,49 @@ export function createApp(config) {
                 reject(new Error(`Request timeout after ${timeoutMs}ms`));
             }, timeoutMs);
 
+            // A client that has already gone must not be waited on: stop the
+            // upstream subscription and report the turn as canceled so callers
+            // can skip the poll fallback instead of re-running the request.
+            const onClientGone = () => {
+                if (finished) return;
+                finished = true;
+                clearTimeout(timeoutId);
+                controller.abort();
+                logDebug('Client disconnected, aborting upstream turn', {
+                    sessionId,
+                    ms: Date.now() - startedAt,
+                    deltaChars
+                });
+                resolve({
+                    content,
+                    reasoning,
+                    usage: reportedUsage,
+                    clientGone: true,
+                    receivedDelta
+                });
+            };
+            const clientAlreadyGone = clientSignal && clientSignal.aborted;
+            if (clientAlreadyGone) {
+                // Nothing can be collected for a request nobody is waiting for.
+                finished = true;
+                clearTimeout(timeoutId);
+                controller.abort();
+                resolve({ content: '', reasoning: '', usage: null, clientGone: true, receivedDelta: false });
+                return;
+            }
+            if (clientSignal) clientSignal.addEventListener('abort', onClientGone, { once: true });
+
+            const releaseClientSignal = () => {
+                if (clientSignal) clientSignal.removeEventListener('abort', onClientGone);
+            };
+
             const firstDeltaTimer = firstDeltaTimeoutMs
                 ? setTimeout(() => {
                     if (finished || receivedDelta) return;
                     finished = true;
                     controller.abort();
                     logDebug('No event data received', { sessionId, ms: Date.now() - startedAt });
-                    resolve({ content: '', reasoning: '', noData: true });
+                    resolve({ content: '', reasoning: '', usage: null, noData: true });
                 }, firstDeltaTimeoutMs)
                 : null;
 
@@ -1846,6 +1987,7 @@ export function createApp(config) {
                     resolve({
                         content,
                         reasoning,
+                        usage: reportedUsage,
                         idleTimeout: true,
                         receivedDelta
                     });
@@ -1928,6 +2070,19 @@ export function createApp(config) {
                             event.properties.info?.sessionID === sessionId) {
                             const info = event.properties.info;
                             const finish = info.finish;
+                            // The backend counts real tokens; keep them so the
+                            // response and the per-key meter report what the
+                            // provider charged instead of a character estimate.
+                            if (info.tokens && !reportedUsage) {
+                                reportedUsage = usageFromInfo(info);
+                                if (onUsage) {
+                                    try {
+                                        onUsage(reportedUsage);
+                                    } catch (e) {
+                                        logDebug('Usage sink failed', { sessionId, error: e.message });
+                                    }
+                                }
+                            }
                             // An aborted or failed message never produces another delta. Without
                             // this, the collector waits out the whole first-delta window before
                             // polling rediscovers the same error.
@@ -1936,12 +2091,13 @@ export function createApp(config) {
                                 clearTimeout(timeoutId);
                                 if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                                 if (idleTimer) clearTimeout(idleTimer);
+                                releaseClientSignal();
                                 logDebug('SSE upstream message error', {
                                     sessionId,
                                     ms: Date.now() - startedAt,
                                     error: info.error.name || 'UnknownError'
                                 });
-                                resolve({ content, reasoning, error: info.error });
+                                resolve({ content, reasoning, usage: reportedUsage, error: info.error });
                                 break;
                             }
                             // Reconcile active tool calls from the full message snapshot so we
@@ -1981,12 +2137,13 @@ export function createApp(config) {
                                     clearTimeout(timeoutId);
                                     if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                                     if (idleTimer) clearTimeout(idleTimer);
+                                    releaseClientSignal();
                                     logDebug('SSE completed', {
                                         sessionId,
                                         ms: Date.now() - startedAt,
                                         deltaChars
                                     });
-                                    resolve({ content, reasoning });
+                                    resolve({ content, reasoning, usage: reportedUsage });
                                 }
                                 break;
                             }
@@ -1998,6 +2155,7 @@ export function createApp(config) {
                         clearTimeout(timeoutId);
                         if (firstDeltaTimer) clearTimeout(firstDeltaTimer);
                         if (idleTimer) clearTimeout(idleTimer);
+                        releaseClientSignal();
                         reject(e);
                     }
                 }
@@ -2025,6 +2183,49 @@ export function createApp(config) {
                 let mID = 'kimi-k2.5-free';
                 let id = `chatcmpl-${crypto.randomUUID()}`;
                 let keepaliveInterval = null;
+                // Flipped as soon as the caller is gone: the turn is aborted
+                // upstream and no fallback work is started for a response that
+                // has nowhere to go. Declared out here because the fallback runs
+                // after the collectors return.
+                let clientGone = false;
+                let abortIssued = false;
+                // Idempotent: the close handler and the request cleanup both want
+                // the backend to stop, and one abort is enough.
+                const abortBackendTurn = () => {
+                    if (!sessionId || abortIssued) return;
+                    abortIssued = true;
+                    Promise.resolve()
+                        .then(() => client.session.abort({ path: { id: sessionId } }))
+                        .catch((e) => logDebug('Failed to abort canceled backend turn', { sessionId, error: e.message }));
+                };
+                const clientAbort = new AbortController();
+                // The signal aborts this request's own backend call; the session
+                // itself needs an explicit abort, because a backend that is
+                // mid-generation does not notice a dropped HTTP client. Do that
+                // here (not in the request path) so it happens even when the
+                // request is parked in an await.
+                res.on('close', () => {
+                    if (res.writableEnded) return;
+                    clientGone = true;
+                    clientAbort.abort();
+                    if (sessionId) abortBackendTurn();
+                });
+                // One cleanup for every "the caller left" exit: stop the backend
+                // turn, then drop the session. An aborted turn leaves a
+                // half-written assistant message that would poison the next
+                // prompt on that session, and with affinity on it must also be
+                // dropped from the map first.
+                const abortCanceledTurn = async () => {
+                    logDebug('Client gone, aborting backend turn', { sessionId });
+                    abortBackendTurn();
+                    if (affinitySignal) chatSessionEntryDrop(affinitySignal, sessionId);
+                    try {
+                        await client.session.delete({ path: { id: sessionId } });
+                    } catch (e) {
+                        logDebug('Failed to cleanup canceled session:', e.message);
+                    }
+                };
+                let canceledHandled = false;
 
                 try {
                     const { messages, model, tools = [], tool_choice, stream: requestStream, temperature, max_tokens, top_p, frequency_penalty, presence_penalty, stop, reasoning_effort, reasoning, opencode: requestOpencodeConfig } = req.body;
@@ -2287,6 +2488,9 @@ export function createApp(config) {
                     keepaliveInterval = null;
                     let completionTokens = 0;
                     let reasoningTokens = 0;
+                    // Real counts reported by the backend for this turn, when it
+                    // reported any; the estimators below only fill the gaps.
+                    let reportedUsage = null;
 
                     const promptParams = {
                         path: { id: sessionId },
@@ -2304,7 +2508,11 @@ export function createApp(config) {
                             ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
                             ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
                             ...(requestParams.stop && { stop: requestParams.stop })
-                        }
+                        },
+                        // Aborts the HTTP call itself when the client goes away, so
+                        // the backend stops generating instead of finishing work
+                        // nobody will read (and stops holding the lock queue).
+                        signal: clientAbort.signal
                     };
                     const { toolOverrides } = toolControl;
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
@@ -2413,6 +2621,8 @@ export function createApp(config) {
 
                         let collected = null;
                         let streamToolCallsSeen = false;
+                        // Error from the previous attempt, kept for its Retry-After.
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session: the failed attempt left an errored
@@ -2435,7 +2645,8 @@ export function createApp(config) {
                                 streamedToolCalls.length = 0;
                                 completionTokens = 0;
                                 reasoningTokens = 0;
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                // Throttling responses carry the provider's own window.
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             try {
                                 const collectPromise = collectFromEvents(
@@ -2443,7 +2654,11 @@ export function createApp(config) {
                                     REQUEST_TIMEOUT_MS,
                                     sendDelta,
                                     EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                    EVENT_IDLE_TIMEOUT_MS
+                                    EVENT_IDLE_TIMEOUT_MS,
+                                    {
+                                        signal: clientAbort.signal,
+                                        onUsage: (usage) => { reportedUsage = usage; }
+                                    }
                                 );
                                 const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                                 client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
@@ -2451,8 +2666,11 @@ export function createApp(config) {
                             } catch (e) {
                                 logDebug('Stream error:', e.message);
                             }
+                            if (collected?.clientGone) clientGone = true;
+                            if (clientGone) break;
 
                             const attemptError = collected?.error || collected?.__error || null;
+                            lastAttemptError = attemptError;
                             const nothingStreamed = !rawStreamedContent
                                 && !rawStreamedReasoning
                                 && streamedToolCalls.length === 0;
@@ -2468,30 +2686,39 @@ export function createApp(config) {
                             break;
                         }
 
-                        if (collected && collected.__error) {
+                        // Every fallback below re-reads the session through polling.
+                        // With the caller gone there is nobody to stream to and the
+                        // turn was aborted, so re-running it would be pure cost.
+                        if (collected && collected.__error && !clientGone) {
                             logDebug('SSE collect error, falling back to polling', {
                                 sessionId,
                                 error: collected.__error?.message
                             });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (polled.usage) reportedUsage = polled.usage;
+                            const { content, reasoning, error } = polled;
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
-                        } else if (collected && collected.noData) {
+                        } else if (collected && collected.noData && !clientGone) {
                             logDebug('Fallback to polling (stream)', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (polled.usage) reportedUsage = polled.usage;
+                            const { content, reasoning, error } = polled;
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
-                        } else if (collected && collected.idleTimeout) {
+                        } else if (collected && collected.idleTimeout && !clientGone) {
                             logDebug('SSE idle timeout, polling for completion', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (polled.usage) reportedUsage = polled.usage;
+                            const { content, reasoning, error } = polled;
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else {
@@ -2511,9 +2738,11 @@ export function createApp(config) {
                             if (collected.content) sendDelta(collected.content, false);
                         }
 
-                        if (!streamedContent && !streamedReasoning) {
+                        if (!streamedContent && !streamedReasoning && !clientGone) {
                             logDebug('SSE returned empty, falling back to polling', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (polled.usage) reportedUsage = polled.usage;
+                            const { content, reasoning, error } = polled;
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else {
@@ -2598,6 +2827,15 @@ export function createApp(config) {
 
                         if (keepaliveInterval) clearInterval(keepaliveInterval);
 
+                        // Nothing below can reach a caller that left; stop the
+                        // backend turn now so it does not keep generating (and
+                        // holding the lock queue) for the rest of the timeout.
+                        if (clientGone) {
+                            await abortCanceledTurn();
+                            canceledHandled = true;
+                            return;
+                        }
+
                         if (affinitySignal && !streamToolCallsSeen) {
                             chatSessionEntryComplete(affinitySignal, sessionId, [...(reuseUserTurns || []), lastUserMsg]);
                         } else if (affinitySignal) {
@@ -2605,21 +2843,29 @@ export function createApp(config) {
                         }
                         // Usage reflects only what was sent upstream: a resumed
                         // turn transmits just the new turns, not the history the
-                        // session's prompt cache already holds.
+                        // session's prompt cache already holds. Real counts from
+                        // the backend win; the character estimate only fills in
+                        // when it reported none.
                         const billedPromptText = reuseParts ? reuseParts.map((p) => p.text || '').join('\n\n') : fullPromptText;
-                        const promptTokens = Math.ceil((billedPromptText || '').length / 4);
-                        const totalTokens = promptTokens + completionTokens + reasoningTokens;
-                        meterUsage({ promptTokens, completionTokens: completionTokens + reasoningTokens });
+                        const promptTokens = reportedUsage
+                            ? reportedUsage.promptTokens
+                            : Math.ceil((billedPromptText || '').length / 4);
+                        const completionReported = reportedUsage
+                            ? reportedUsage.completionTokens + reportedUsage.reasoningTokens
+                            : completionTokens + reasoningTokens;
+                        const reasoningReported = reportedUsage ? reportedUsage.reasoningTokens : reasoningTokens;
+                        const totalTokens = promptTokens + completionReported;
+                        meterUsage({ promptTokens, completionTokens: completionReported });
 
                         res.write(`data: ${JSON.stringify({ 
                             id, 
                             choices: [{ index: 0, delta: {}, finish_reason: finalStreamedToolCalls.length > 0 ? 'tool_calls' : 'stop' }],
                             usage: {
                                 prompt_tokens: promptTokens,
-                                completion_tokens: completionTokens + reasoningTokens,
+                                completion_tokens: completionReported,
                                 total_tokens: totalTokens,
                                 completion_tokens_details: {
-                                    reasoning_tokens: reasoningTokens
+                                    reasoning_tokens: reasoningReported
                                 }
                             }
                         })}\n\n`);
@@ -2629,6 +2875,7 @@ export function createApp(config) {
                         let content = '';
                         let reasoning = '';
                         let error = null;
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session: the failed attempt left an errored
@@ -2643,8 +2890,9 @@ export function createApp(config) {
                                 sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
                                 requestForcedChatToolCall = makeForcedChatToolCallRequester();
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
+                            if (clientGone) break;
                             const attemptStart = Date.now();
                             await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                             logDebug('Prompt sent', { sessionId, ms: Date.now() - attemptStart, attempt });
@@ -2652,6 +2900,8 @@ export function createApp(config) {
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
                             error = collected.error || null;
+                            lastAttemptError = error;
+                            if (collected.usage) reportedUsage = collected.usage;
                             // Bounded retry for upstream throttling mislabeled as billing
                             // errors (401 CreditsError etc.); only when nothing usable was
                             // produced, so real failures still surface after RETRY_MAX_ATTEMPTS.
@@ -2666,6 +2916,15 @@ export function createApp(config) {
                                 continue;
                             }
                             break;
+                        }
+                        if (clientGone) {
+                            // Nothing left to answer: stop the backend turn here
+                            // and let the error path keep session cleanup in one
+                            // place.
+                            logDebug('Client disconnected before the non-streaming reply', { sessionId });
+                            await abortCanceledTurn();
+                            canceledHandled = true;
+                            return;
                         }
                         if (error && !content && !reasoning) {
                             if (affinitySignal) await chatSessionEntryFail(affinitySignal, sessionId);
@@ -2699,11 +2958,19 @@ export function createApp(config) {
 
                         // Usage reflects only what was sent upstream: a resumed
                         // turn transmits just the new turns, not the history the
-                        // session's prompt cache already holds.
+                        // session's prompt cache already holds. Real counts from
+                        // the backend win; the character estimate fills in only
+                        // when it reported none.
                         const billedPromptText = reuseParts ? reuseParts.map((p) => p.text || '').join('\n\n') : fullPromptText;
-                        const promptTokens = Math.ceil((billedPromptText || '').length / 4);
-                        const completionTokensCalc = Math.ceil((content || '').length / 4);
-                        const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
+                        const promptTokens = reportedUsage
+                            ? reportedUsage.promptTokens
+                            : Math.ceil((billedPromptText || '').length / 4);
+                        const completionTokensCalc = reportedUsage
+                            ? reportedUsage.completionTokens
+                            : Math.ceil((content || '').length / 4);
+                        const reasoningTokensCalc = reportedUsage
+                            ? reportedUsage.reasoningTokens
+                            : Math.ceil((reasoning || '').length / 4);
                         const totalTokens = promptTokens + completionTokensCalc + reasoningTokensCalc;
                         meterUsage({ promptTokens, completionTokens: completionTokensCalc + reasoningTokensCalc });
 
@@ -2756,6 +3023,14 @@ export function createApp(config) {
                         res.end();
                     }
                     if (sessionId) {
+                        if (clientGone) {
+                            // Caller left and the turn was canceled: stop the
+                            // backend and drop the poisoned session. Already done
+                            // when the request returned early from a non-streaming
+                            // cancel.
+                            if (!canceledHandled) await abortCanceledTurn();
+                            return;
+                        }
                         // With affinity on, an exception mid-turn also poisons the
                         // backend session: drop the mapping before deleting so the
                         // next turn starts a clean session with full history.
@@ -2814,11 +3089,44 @@ export function createApp(config) {
                 let stream = false;
                 let pID = 'opencode';
                 let mID = 'kimi-k2.5-free';
+                // See the Chat handler: stop generating for a caller that left.
+                let clientGone = false;
+                // Real counts reported by the backend, when it reported any.
+                let reportedUsage = null;
+                let abortIssued = false;
+                const abortBackendTurn = () => {
+                    if (!sessionId || abortIssued) return;
+                    abortIssued = true;
+                    Promise.resolve()
+                        .then(() => client.session.abort({ path: { id: sessionId } }))
+                        .catch((e) => logDebug('Failed to abort canceled Anthropic backend turn', { sessionId, error: e.message }));
+                };
+                const clientAbort = new AbortController();
+                // See the Chat handler: the backend session needs an explicit
+                // abort on top of dropping this request's own call.
+                res.on('close', () => {
+                    if (res.writableEnded) return;
+                    clientGone = true;
+                    clientAbort.abort();
+                    if (sessionId) abortBackendTurn();
+                });
 
                 const anthropicError = (statusCode, type, message) => res.status(statusCode).json({
                     type: 'error',
                     error: { type, message }
                 });
+
+                // See the Chat handler: one cleanup for every "caller left" exit.
+                const abortCanceledTurn = async () => {
+                    logDebug('Client gone, aborting Anthropic backend turn', { sessionId });
+                    abortBackendTurn();
+                    try {
+                        await client.session.delete({ path: { id: sessionId } });
+                    } catch (e) {
+                        logDebug('Failed to cleanup canceled Anthropic session:', e.message);
+                    }
+                };
+                let canceledHandled = false;
 
                 try {
                     const body = req.body || {};
@@ -3065,7 +3373,9 @@ export function createApp(config) {
                             ...(requestParams.temperature !== undefined && { temperature: requestParams.temperature }),
                             ...(requestParams.top_p !== undefined && { top_p: requestParams.top_p }),
                             ...(requestParams.stop && { stop: requestParams.stop })
-                        }
+                        },
+                        // Aborts the backend call when the caller goes away.
+                        signal: clientAbort.signal
                     };
                     const { toolOverrides } = toolControl;
                     if (toolOverrides && Object.keys(toolOverrides).length > 0) {
@@ -3204,6 +3514,8 @@ export function createApp(config) {
                         };
 
                         let collected = null;
+                        // Error from the previous attempt, kept for its Retry-After.
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session (same rationale as chat completions).
@@ -3222,7 +3534,7 @@ export function createApp(config) {
                                 streamedToolCalls.length = 0;
                                 completionTokens = 0;
                                 reasoningTokens = 0;
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
                             try {
                                 const collectPromise = collectFromEvents(
@@ -3230,7 +3542,11 @@ export function createApp(config) {
                                     REQUEST_TIMEOUT_MS,
                                     sendDelta,
                                     EVENT_FIRST_DELTA_TIMEOUT_MS,
-                                    EVENT_IDLE_TIMEOUT_MS
+                                    EVENT_IDLE_TIMEOUT_MS,
+                                    {
+                                        signal: clientAbort.signal,
+                                        onUsage: (usage) => { reportedUsage = usage; }
+                                    }
                                 );
                                 const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                                 client.session.prompt(promptParams).catch(err => logDebug('Prompt error:', err.message));
@@ -3238,8 +3554,11 @@ export function createApp(config) {
                             } catch (e) {
                                 logDebug('Anthropic stream error:', e.message);
                             }
+                            if (collected?.clientGone) clientGone = true;
+                            if (clientGone) break;
 
                             const attemptError = collected?.error || collected?.__error || null;
+                            lastAttemptError = attemptError;
                             const nothingStreamed = !rawStreamedContent
                                 && !rawStreamedReasoning
                                 && streamedToolCalls.length === 0;
@@ -3256,7 +3575,9 @@ export function createApp(config) {
                         }
 
                         const pollFallback = async (mode) => {
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            if (polled.usage) reportedUsage = polled.usage;
+                            const { content, reasoning, error } = polled;
                             if (error && !content && !reasoning) {
                                 logDebug('Anthropic stream fallback error', { error: error.message });
                                 return;
@@ -3279,11 +3600,13 @@ export function createApp(config) {
                             if (content) sendDelta(content, false);
                         };
                         let didFullPoll = false;
-                        if (collected && (collected.__error || collected.noData)) {
+                        // Every fallback re-reads the session; with the caller gone
+                        // there is nothing to send and the turn was aborted.
+                        if (collected && (collected.__error || collected.noData) && !clientGone) {
                             logDebug('Anthropic SSE fallback to polling', { sessionId });
                             didFullPoll = true;
                             await pollFallback('full');
-                        } else if (collected && collected.idleTimeout && (streamedContent || streamedReasoning || streamedToolCalls.length > 0)) {
+                        } else if (collected && collected.idleTimeout && (streamedContent || streamedReasoning || streamedToolCalls.length > 0) && !clientGone) {
                             logDebug('Anthropic SSE idle timeout, polling for remainder', { sessionId });
                             await pollFallback('idleTimeout');
                         }
@@ -3291,10 +3614,10 @@ export function createApp(config) {
                             if (collected.reasoning) sendDelta(collected.reasoning, true);
                             if (collected.content) sendDelta(collected.content, false);
                         }
-                        if (!didFullPoll && !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0) {
+                        if (!didFullPoll && !rawStreamedContent && !rawStreamedReasoning && streamedToolCalls.length === 0 && !clientGone) {
                             logDebug('Anthropic SSE returned empty, falling back to polling', { sessionId });
                             await pollFallback('full');
-                        } else if (rawStreamedReasoning && !rawStreamedContent && streamedToolCalls.length === 0) {
+                        } else if (rawStreamedReasoning && !rawStreamedContent && streamedToolCalls.length === 0 && !clientGone) {
                             logDebug('Anthropic reasoning streamed without content, reconciling from snapshot', { sessionId });
                             const snapshot = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS).catch(() => null);
                             if (snapshot && snapshot.content) {
@@ -3353,7 +3676,19 @@ export function createApp(config) {
                         if (keepaliveInterval) clearInterval(keepaliveInterval);
                         keepaliveInterval = null;
 
-                        const outputTokens = completionTokens + reasoningTokens;
+                        // See the Chat stream: a caller that left gets no more
+                        // events, and the backend turn is stopped right away.
+                        if (clientGone) {
+                            await abortCanceledTurn();
+                            canceledHandled = true;
+                            return;
+                        }
+
+                        // message_delta below reports the output count; the input
+                        // count on message_start is the estimate declared above.
+                        const outputTokens = reportedUsage
+                            ? reportedUsage.completionTokens + reportedUsage.reasoningTokens
+                            : completionTokens + reasoningTokens;
 
                         // Upstream failed on every attempt and fallbacks recovered
                         // nothing: surface an Anthropic error event instead of an
@@ -3400,18 +3735,35 @@ export function createApp(config) {
                             blockIndex += 1;
                         });
 
+                        if (clientGone) {
+                            // Cancelled: nothing to report to a caller that left,
+                            // and the backend turn must be stopped here because
+                            // this path returns instead of throwing.
+                            logDebug('Client disconnected before the Anthropic stream finished', { sessionId });
+                            await abortCanceledTurn();
+                            canceledHandled = true;
+                            return;
+                        }
                         writeEvent({
                             type: 'message_delta',
                             delta: { stop_reason: anthropicStopReason(validatedToolCalls.length), stop_sequence: null },
                             usage: { output_tokens: outputTokens }
                         });
-                        meterUsage({ promptTokens, completionTokens: outputTokens });
+                        // message_start was already sent with the estimated input
+                        // count (nothing else is known at first delta), but the
+                        // meter takes the backend's real numbers when it reported
+                        // them.
+                        meterUsage({
+                            promptTokens: reportedUsage ? reportedUsage.promptTokens : promptTokens,
+                            completionTokens: outputTokens
+                        });
                         writeEvent({ type: 'message_stop' });
                         res.end();
                     } else {
                         let content = '';
                         let reasoning = '';
                         let error = null;
+                        let lastAttemptError = null;
                         for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
                             if (attempt > 1) {
                                 // Retry on a fresh session (same rationale as chat completions).
@@ -3423,13 +3775,16 @@ export function createApp(config) {
                                 sessionId = await createSession(toolControl);
                                 promptParams.path.id = sessionId;
                                 requestForcedAnthropicToolCall = makeForcedAnthropicToolCallRequester();
-                                await sleep(RETRY_BACKOFF_BASE_MS * attempt);
+                                await sleep(retryDelayMs({ attempt, response: lastAttemptError?.response }));
                             }
+                            if (clientGone) break;
                             await promptWithTimeout(promptParams, REQUEST_TIMEOUT_MS);
                             const collected = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
                             content = collected.content || '';
                             reasoning = collected.reasoning || '';
                             error = collected.error || null;
+                            lastAttemptError = error;
+                            if (collected.usage) reportedUsage = collected.usage;
                             if (
                                 error
                                 && !content
@@ -3441,6 +3796,12 @@ export function createApp(config) {
                                 continue;
                             }
                             break;
+                        }
+                        if (clientGone) {
+                            logDebug('Client disconnected before the Anthropic reply', { sessionId });
+                            await abortCanceledTurn();
+                            canceledHandled = true;
+                            return;
                         }
                         if (error && !content && !reasoning) {
                             // 5xx keeps a normalized Anthropic type: upstream error
@@ -3484,9 +3845,15 @@ export function createApp(config) {
                             });
                         });
 
-                        const promptTokens = Math.ceil((fullPromptText || '').length / 4);
-                        const completionTokensCalc = Math.ceil((content || '').length / 4);
-                        const reasoningTokensCalc = Math.ceil((reasoning || '').length / 4);
+                        const promptTokens = reportedUsage
+                            ? reportedUsage.promptTokens
+                            : Math.ceil((fullPromptText || '').length / 4);
+                        const completionTokensCalc = reportedUsage
+                            ? reportedUsage.completionTokens
+                            : Math.ceil((content || '').length / 4);
+                        const reasoningTokensCalc = reportedUsage
+                            ? reportedUsage.reasoningTokens
+                            : Math.ceil((reasoning || '').length / 4);
                         meterUsage({ promptTokens, completionTokens: completionTokensCalc + reasoningTokensCalc });
 
                         res.json({
@@ -3535,6 +3902,13 @@ export function createApp(config) {
                         res.end();
                     }
                     if (sessionId) {
+                        if (clientGone) {
+                            // Caller left and the turn was canceled; stop the
+                            // backend and drop the poisoned session. The early
+                            // returns above already did this.
+                            if (!canceledHandled) await abortCanceledTurn();
+                            return;
+                        }
                         try {
                             await client.session.delete({ path: { id: sessionId } });
                         } catch (e) {
@@ -3822,6 +4196,11 @@ export function createApp(config) {
     });
 
     app.post('/v1/responses', async (req, res) => {
+        // Declared outside the try so the catch block can tell a canceled turn
+        // from a failure (see below).
+        let sessionId = null;
+        let clientGone = false;
+        let abortIssued = false;
         try {
             const {
                 model,
@@ -3849,6 +4228,22 @@ export function createApp(config) {
                 usageMetered = true;
                 keyUsage.trackUsage(req.apiKeyName, { promptTokens, completionTokens });
             };
+
+            // See the Chat handler: a caller that disconnects cancels the turn
+            // instead of leaving the backend to finish work nobody reads.
+            const clientAbort = new AbortController();
+            // See the Chat handler: abort the backend session explicitly.
+            res.on('close', () => {
+                if (res.writableEnded) return;
+                clientGone = true;
+                clientAbort.abort();
+                if (sessionId && !abortIssued) {
+                    abortIssued = true;
+                    Promise.resolve()
+                        .then(() => client.session.abort({ path: { id: sessionId } }))
+                        .catch((e) => logDebug('Failed to abort canceled Responses backend turn', { sessionId, error: e.message }));
+                }
+            });
 
             // Stateful continuation: reuse the session behind a previous response so the
             // client only needs to send the new turn (OpenAI Responses API semantics).
@@ -4012,7 +4407,7 @@ export function createApp(config) {
             // With the tool-lock plugin, a chained session keeps the policy it was
             // created with, so toolControl.title only matters for new sessions.
             const toolControl = await resolveToolControl(toolMode, internalToolContext);
-            let sessionId = previousState?.sessionId || null;
+            sessionId = previousState?.sessionId || null;
             if (!sessionId) {
                 sessionId = await createSession(toolControl);
             }
@@ -4066,7 +4461,9 @@ export function createApp(config) {
                     ...(max_output_tokens && { max_tokens: max_output_tokens }),
                     ...(temperature !== undefined && { temperature }),
                     ...(top_p !== undefined && { top_p })
-                }
+                },
+                // Aborts the backend call when the caller goes away.
+                signal: clientAbort.signal
             };
             const { toolOverrides } = toolControl;
             if (toolOverrides && Object.keys(toolOverrides).length > 0) {
@@ -4075,6 +4472,8 @@ export function createApp(config) {
 
             let content = '';
             let reasoning = '';
+            // Real counts from the backend, when it reported them.
+            let reportedUsage = null;
             const buildResponsesFunctionCallOutputItem = (toolCall) => ({
                 id: toolCall.id,
                 type: 'function_call',
@@ -4258,7 +4657,11 @@ export function createApp(config) {
                         REQUEST_TIMEOUT_MS,
                         sendResponsesDelta,
                         EVENT_FIRST_DELTA_TIMEOUT_MS,
-                        EVENT_IDLE_TIMEOUT_MS
+                        EVENT_IDLE_TIMEOUT_MS,
+                        {
+                            signal: clientAbort.signal,
+                            onUsage: (usage) => { reportedUsage = usage; }
+                        }
                     );
                     const safeCollect = collectPromise.catch((err) => ({ __error: err }));
                     client.session.prompt(promptParams).catch(err => logDebug('Responses prompt error:', err.message));
@@ -4266,14 +4669,17 @@ export function createApp(config) {
                 } catch (e) {
                     collected = { __error: e };
                 }
+                if (collected?.clientGone) clientGone = true;
 
-                if (!content && !reasoning) {
+                if (!content && !reasoning && !clientGone) {
                     const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                    if (polled.usage) reportedUsage = polled.usage;
                     if (polled.error && !polled.content && !polled.reasoning) throw polled.error;
                     if (polled.reasoning) sendResponsesDelta(polled.reasoning, true);
                     if (polled.content) sendResponsesDelta(polled.content, false);
-                } else if (collected && collected.idleTimeout) {
+                } else if (collected && collected.idleTimeout && !clientGone) {
                     const polled = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                    if (polled.usage) reportedUsage = polled.usage;
                     const remainingReasoning = polled.reasoning && polled.reasoning.startsWith(rawReasoning)
                         ? polled.reasoning.slice(rawReasoning.length)
                         : polled.reasoning;
@@ -4310,6 +4716,15 @@ export function createApp(config) {
                 }
 
                 const hasMeaningfulContent = Boolean(content && content.trim());
+
+                if (clientGone) {
+                    // Caller left: the turn was canceled, so there is no
+                    // completion to report and no snapshot worth polling for.
+                    // The catch block aborts the backend turn and drops the
+                    // session.
+                    logDebug('Client disconnected, abandoning the Responses stream', { sessionId });
+                    throw new Error('client disconnected');
+                }
 
                 if (announcedContent && hasMeaningfulContent) {
                     emit({
@@ -4397,9 +4812,15 @@ export function createApp(config) {
                 validatedStreamedToolCalls.forEach((toolCall) => {
                     streamOutput.push(buildResponsesFunctionCallOutputItem(toolCall));
                 });
-                const promptTokens = Math.ceil(fullPromptText.length / 4);
-                const completionTokens = Math.ceil(content.length / 4);
-                const reasoningTokens = Math.ceil(reasoning.length / 4);
+                const promptTokens = reportedUsage
+                    ? reportedUsage.promptTokens
+                    : Math.ceil(fullPromptText.length / 4);
+                const completionTokens = reportedUsage
+                    ? reportedUsage.completionTokens
+                    : Math.ceil(content.length / 4);
+                const reasoningTokens = reportedUsage
+                    ? reportedUsage.reasoningTokens
+                    : Math.ceil(reasoning.length / 4);
                 meterUsage({ promptTokens, completionTokens: completionTokens + reasoningTokens });
                 const response = {
                     id: responseId,
@@ -4424,6 +4845,8 @@ export function createApp(config) {
 
             const responseRes = await client.session.prompt(promptParams);
             const responseParts = responseRes.data?.parts || [];
+            // 1.x answers the prompt with the finished message, tokens included.
+            if (!reportedUsage) reportedUsage = usageFromInfo(responseRes.data?.info);
             const promptContent = responseParts.filter(p => p.type === 'text').map(p => p.text).join('\n');
             const promptReasoning = responseParts.filter(p => p.type === 'reasoning').map(p => p.text).join('\n');
             const promptParsedToolCalls = externalToolRegistry.length > 0
@@ -4469,9 +4892,15 @@ export function createApp(config) {
             const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
             const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
 
-            const promptTokens = Math.ceil(fullPromptText.length / 4);
-            const completionTokens = Math.ceil(content.length / 4);
-            const reasoningTokens = Math.ceil(reasoning.length / 4);
+            const promptTokens = reportedUsage
+                ? reportedUsage.promptTokens
+                : Math.ceil(fullPromptText.length / 4);
+            const completionTokens = reportedUsage
+                ? reportedUsage.completionTokens
+                : Math.ceil(content.length / 4);
+            const reasoningTokens = reportedUsage
+                ? reportedUsage.reasoningTokens
+                : Math.ceil(reasoning.length / 4);
             meterUsage({ promptTokens, completionTokens: completionTokens + reasoningTokens });
             const output = [];
             const messageOutputItem = buildResponsesMessageOutputItem(safeContent);
@@ -4501,6 +4930,21 @@ export function createApp(config) {
 
             return res.json(response);
         } catch (error) {
+            // Cancelled turns are not failures: the caller is gone, so stop the
+            // backend turn and leave the (closed) stream alone instead of
+            // reporting a response.failed nobody can read.
+            if (clientGone) {
+                logDebug('Cancelled Responses turn, aborting backend', { sessionId });
+                if (sessionId && !abortIssued) {
+                    abortIssued = true;
+                    try {
+                        await client.session.abort({ path: { id: sessionId } });
+                    } catch (e) {
+                        logDebug('Failed to abort canceled Responses turn', { sessionId, error: e.message });
+                    }
+                }
+                return;
+            }
             console.error('[Proxy] Responses API Error:', error?.message || error?.data?.message || error?.name || error);
             const transformed = transformUpstreamError(error);
             // Once the SSE headers are out, res.json() throws ERR_HTTP_HEADERS_SENT. That throw
@@ -4532,7 +4976,7 @@ export function createApp(config) {
         });
     });
 
-    return { app, client };
+    return { app, client, persistUsageNow };
 }
 
 // Backend management state (per-instance)
@@ -4826,10 +5270,17 @@ export function startProxy(options) {
             false,
         OPENCODE_HOME_BASE: options.OPENCODE_HOME_BASE || null,
         EVENT_IDLE_TIMEOUT_MS: options.EVENT_IDLE_TIMEOUT_MS,
-        EVENT_FIRST_DELTA_TIMEOUT_MS: options.EVENT_FIRST_DELTA_TIMEOUT_MS
+        EVENT_FIRST_DELTA_TIMEOUT_MS: options.EVENT_FIRST_DELTA_TIMEOUT_MS,
+        // Per-key counters are only meaningful with named keys, so persistence
+        // follows multi-user mode: on when configured keys exist, off otherwise.
+        USAGE_PERSISTENCE: normalizeBool(options.USAGE_PERSISTENCE) ??
+            normalizeBool(process.env.OPENCODE_USAGE_PERSISTENCE) ??
+            true,
+        USAGE_FILE: options.USAGE_FILE || process.env.OPENCODE_USAGE_FILE || defaultUsageFilePath(options.configPath),
+        USAGE_SAVE_INTERVAL_MS: Number(options.USAGE_SAVE_INTERVAL_MS || process.env.OPENCODE_USAGE_SAVE_INTERVAL_MS || DEFAULT_USAGE_SAVE_INTERVAL_MS)
     };
 
-    const { app } = createApp(config);
+    const { app, persistUsageNow } = createApp(config);
     
     const server = app.listen(config.PORT, config.BIND_HOST, async () => {
         console.log(`[Proxy] Active at http://${config.BIND_HOST}:${config.PORT}`);
@@ -4842,6 +5293,11 @@ export function startProxy(options) {
 
     return {
         server,
+        /**
+         * Flush the per-key usage snapshot. Call this from the signal handler
+         * before closing the server: a restart must not cost a metering window.
+         */
+        persistUsage: () => persistUsageNow(),
         killBackend: () => {
             const state = backendState.get(config.OPENCODE_SERVER_URL);
             if (state && state.process) {

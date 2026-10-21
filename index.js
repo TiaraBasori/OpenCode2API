@@ -201,26 +201,30 @@ process.on('unhandledRejection', (reason) => {
 
 // Start the proxy
 try {
-    const proxy = startProxy(finalConfig);
+    const proxy = startProxy({ ...finalConfig, configPath });
     
     // Handle graceful shutdown
-    process.on('SIGINT', () => {
-        console.log('\n[Shutdown] Received SIGINT, shutting down gracefully...');
-        proxy.killBackend();
-        proxy.server.close(() => {
-            console.log('[Shutdown] Server closed');
-            process.exit(0);
-        });
-    });
+    // One shutdown path for both signals: flush the per-key usage snapshot
+    // first (a restart must not lose a metering window), then stop accepting
+    // connections, then stop the backend.
+    const shutdown = (signal) => {
+        console.log(`\n[Shutdown] Received ${signal}, shutting down gracefully...`);
+        Promise.resolve()
+            .then(() => proxy.persistUsage())
+            .catch((error) => console.error('[Shutdown] Usage snapshot failed:', error.message))
+            .finally(() => {
+                proxy.killBackend();
+                proxy.server.close(() => {
+                    console.log('[Shutdown] Server closed');
+                    process.exit(0);
+                });
+            });
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
     
-    process.on('SIGTERM', () => {
-        console.log('\n[Shutdown] Received SIGTERM, shutting down gracefully...');
-        proxy.killBackend();
-        proxy.server.close(() => {
-            console.log('[Shutdown] Server closed');
-            process.exit(0);
-        });
-    });
+
 } catch (error) {
     console.error('[Fatal] Failed to start proxy:', error.message);
     process.exit(1);
