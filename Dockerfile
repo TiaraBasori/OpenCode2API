@@ -2,7 +2,7 @@
 # Local `dist/` stays in .dockerignore (never enters context); the runtime
 # COPY --from=builder bypasses the ignore because it copies from the build
 # stage filesystem, not from the build context.
-FROM node:lts-slim AS builder
+FROM node:24.22.1-slim AS builder
 
 WORKDIR /build
 
@@ -15,7 +15,7 @@ COPY src ./src
 RUN npm run build
 
 # ---------------- runtime ----------------
-FROM node:lts-slim
+FROM node:24.22.1-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
