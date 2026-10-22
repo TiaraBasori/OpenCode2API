@@ -3,7 +3,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/version-1.6.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
-  <img src="https://img.shields.io/badge/Node.js-22.19+-orange" alt="Node">
+  <img src="https://img.shields.io/badge/Node.js-22.23.4+-orange" alt="Node">
 </p>
 
 > **Language:** [English](./README.md) | [简体中文](./README.zh-CN.md)

@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > 起由 `samson910022/OpenCode2API` 独立维护。`v1.5.0`（含）以前见上游历史；
 > 此后变更见本节（`[Unreleased]`）及后续版本节。
 
+### Security
+
+- **Node.js October 2026 Security Releases remediation**: updated engine constraint in `package.json` to `>=22.23.4`, upgraded `undici` to `^8.12.3`, resolved `follow-redirects` in lockfile, pinned Dockerfile base images to `node:24.22.1-slim`, and enforced `node-version: '24.22.1'` with `check-latest: true` across all GitHub Actions workflows (mitigating CVE-2026-105482, CVE-2026-105483, CVE-2026-106069, and CVE-2026-111497 Brotli RCE). 修復 Node.js 2026 年 10 月安全通報相關弱點，將 runtime 與 CI/Docker 基準固定至安全版本。
+
 ### Changed
 
 - **独立维护声明**：README 致谢明确直接上游 `TiaraBasori/opencode2api`，LICENSE 追加上游归属，CHANGELOG 声明分叉点。

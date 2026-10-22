@@ -13,7 +13,7 @@
 
 ## 2. Tech stack & commands (single source of truth)
 
-- `node >= 22.19` (undici 8 `engines` floor), TypeScript (`tsconfig.json`: `module/moduleResolution NodeNext`, `strict`, `noEmitOnError`), Express, Jest 30 + Supertest via `@swc/jest`, `tsx` for dev.
+- `node >= 22.23.4` (security floor: CVE-2026-105482 / CVE-2026-111497 Brotli/Undici/OpenSSL; undici 8 `engines` floor), TypeScript (`tsconfig.json`: `module/moduleResolution NodeNext`, `strict`, `noEmitOnError`), Express, Jest 30 + Supertest via `@swc/jest`, `tsx` for dev.
 - Run in this order:
   ```bash
   npm run typecheck   # tsc --noEmit (covers index.ts + src/**/*.ts only; tests excluded by design)
